@@ -49,5 +49,7 @@ next-env.d.ts
 config/collector.json
 # Export CLI output.
 /exports/
+# Materialized research datasets (regenerable from the delta stream).
+/research/
 # Local archive backend output (dev only).
 /.archive/

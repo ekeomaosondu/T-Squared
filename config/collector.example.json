@@ -42,18 +42,14 @@
     "privateFills": false
   },
   "sampling": {
+    "$comment": "60s only, and deliberately NOT a research source of truth. These grids exist for dashboards, health checks, quick SQL and sanity checks. Research horizons are materialized offline from the delta stream via `npm run materialize`, which drives the SAME sampler code, so an offline 1s sample equals what live 1s sampling would have produced. A permanent 1s or 5s grid commits to one worldview and costs ~41 GB per three weeks for data that is fully recomputable.",
     "bboIntervalsMs": [
-      1000,
-      5000,
       60000
     ],
     "fullBookIntervalsMs": [
-      5000,
       60000
     ],
     "eventLadderIntervalsMs": [
-      1000,
-      5000,
       60000
     ]
   },

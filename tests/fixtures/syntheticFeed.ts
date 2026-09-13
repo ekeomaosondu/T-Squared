@@ -81,10 +81,16 @@ export class FakeWebSocketClient extends EventEmitter {
     return sid;
   }
 
-  /** Emits a frame exactly as the socket layer would. */
-  deliver(envelope: Record<string, unknown>): void {
+  /**
+   * Emits a frame exactly as the socket layer would.
+   *
+   * `atMs` overrides the receipt clock so a test can lay events on a known
+   * timeline; without it, replay and a live sampler would be comparing
+   * different timelines.
+   */
+  deliver(envelope: Record<string, unknown>, atMs?: number): void {
     const text = JSON.stringify(envelope);
-    const receivedAtMs = Date.now();
+    const receivedAtMs = atMs ?? Date.now();
     const frame: RawFrame = {
       receivedAt: new Date(receivedAtMs),
       receivedAtMs,

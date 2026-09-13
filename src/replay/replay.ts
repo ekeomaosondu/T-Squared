@@ -44,7 +44,20 @@ export interface ReplayOptions {
    * from the window start for each one, which is O(n^2) and unusable on a
    * multi-week dataset.
    */
-  onPosition?: (position: { streamId: string | null; seq: bigint | null; book: MarketBook }) => void;
+  onPosition?: (position: {
+    streamId: string | null;
+    seq: bigint | null;
+    atMs: bigint;
+    book: MarketBook;
+  }) => void;
+  /**
+   * Called BEFORE each event is applied, with the book as it stood.
+   *
+   * Clock-grid materialization needs the state as of a bucket boundary, which
+   * is the state before the first event after that boundary. Sampling after
+   * the event would fold in information the live sampler could not have had.
+   */
+  onBeforeEvent?: (position: { atMs: bigint; book: MarketBook }) => void;
   /** Stop at the first integrity problem rather than continuing. */
   strict?: boolean;
 }
@@ -352,7 +365,12 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
   };
 
   emit(BigInt(seed.received_at_ms));
-  opts.onPosition?.({ streamId: currentStream, seq: book.lastSeq, book });
+  opts.onPosition?.({
+    streamId: currentStream,
+    seq: book.lastSeq,
+    atMs: BigInt(seed.received_at_ms),
+    book,
+  });
 
   for (const delta of deltas) {
     const atMs = BigInt(delta.received_at_ms);
@@ -388,6 +406,7 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
 
     // Re-seed from any snapshot that precedes this delta.
     while (snapIdx < laterSnapshots.length && snapshotPrecedes(laterSnapshots[snapIdx]!, delta)) {
+      opts.onBeforeEvent?.({ atMs: BigInt(laterSnapshots[snapIdx]!.received_at_ms), book });
       const snap = laterSnapshots[snapIdx]!;
       snapIdx += 1;
 
@@ -416,7 +435,12 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
       if (snap.source === 'ws_recovery') epoch.gaps += 1;
 
       emit(BigInt(snap.received_at_ms));
-      opts.onPosition?.({ streamId: currentStream, seq: book.lastSeq, book });
+      opts.onPosition?.({
+        streamId: currentStream,
+        seq: book.lastSeq,
+        atMs: BigInt(snap.received_at_ms),
+        book,
+      });
     }
 
     result.totalDeltas += 1;
@@ -432,6 +456,8 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
       }
       continue;
     }
+
+    opts.onBeforeEvent?.({ atMs, book });
 
     const outcome = book.applyDelta({
       side: delta.side,
@@ -453,7 +479,7 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
     result.appliedDeltas += 1;
     epoch.deltasApplied += 1;
     emit(atMs);
-    opts.onPosition?.({ streamId: delta.stream_id, seq: BigInt(delta.seq), book });
+    opts.onPosition?.({ streamId: delta.stream_id, seq: BigInt(delta.seq), atMs, book });
   }
 
   // A snapshot can land after the final delta -- most often a reconnect's
@@ -484,7 +510,12 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
         result.epochs.push(epoch);
       }
       emit(BigInt(snap.received_at_ms));
-      opts.onPosition?.({ streamId: currentStream, seq: book.lastSeq, book });
+      opts.onPosition?.({
+        streamId: currentStream,
+        seq: book.lastSeq,
+        atMs: BigInt(snap.received_at_ms),
+        book,
+      });
     }
   }
 

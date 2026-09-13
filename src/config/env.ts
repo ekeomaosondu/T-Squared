@@ -69,6 +69,34 @@ const EnvSchema = z.object({
 
   COLLECTOR_CONFIG_PATH: z.string().optional().default('config/collector.json'),
 
+  /**
+   * Identity stamped on every collector session, archive manifest, integrity
+   * report, export and materialized dataset, so every artifact is visibly
+   * associated with the same production dataset.
+   */
+  DATASET_ID: z.string().optional().default('kalshi-dev'),
+  DEPLOYMENT_ENV: z.enum(['production', 'staging', 'development']).default('development'),
+
+  /** Where immutable archives go. r2 and s3 share the S3-compatible client. */
+  ARCHIVE_STORAGE: z.enum(['r2', 's3', 'vercel_blob', 'local']).default('local'),
+
+  /** S3-compatible archive credentials (Cloudflare R2 or AWS S3). */
+  ARCHIVE_BUCKET: z.string().optional().default(''),
+  ARCHIVE_ENDPOINT: z.string().optional().default(''),
+  ARCHIVE_ACCESS_KEY_ID: z.string().optional().default(''),
+  ARCHIVE_SECRET_ACCESS_KEY: z.string().optional().default(''),
+  ARCHIVE_REGION: z.string().optional().default('auto'),
+
+  /**
+   * Direct (non-pooled) Postgres URL.
+   *
+   * Neon's pooler uses transaction pooling, which is right for serverless and
+   * the dashboard but wrong for migrations, session-level maintenance and
+   * DETACH PARTITION CONCURRENTLY. Admin paths use this; the app uses the
+   * pooled DATABASE_URL.
+   */
+  DIRECT_DATABASE_URL: z.string().optional().default(''),
+
   // Supplied automatically by Vercel; used for session attribution only.
   VERCEL_DEPLOYMENT_ID: z.string().optional().default(''),
   VERCEL_GIT_COMMIT_SHA: z.string().optional().default(''),
@@ -112,10 +140,14 @@ export function resetEnvCache(): void {
 /** The ONLY shape of the environment that may be logged. */
 export function redactedEnv(e: Env = env()) {
   return {
+    datasetId: e.DATASET_ID,
+    deploymentEnv: e.DEPLOYMENT_ENV,
+    archiveStorage: e.ARCHIVE_STORAGE,
     kalshiEnv: e.KALSHI_ENV,
     kalshiApiKeyId: e.KALSHI_API_KEY_ID ? `${e.KALSHI_API_KEY_ID.slice(0, 4)}…` : '(unset)',
     kalshiPrivateKey: e.KALSHI_PRIVATE_KEY_PEM ? '(set)' : '(unset)',
     databaseUrl: e.DATABASE_URL ? redactDatabaseUrl(e.DATABASE_URL) : '(unset)',
+    directDatabaseUrl: e.DIRECT_DATABASE_URL ? redactDatabaseUrl(e.DIRECT_DATABASE_URL) : '(unset)',
     blobToken: e.BLOB_READ_WRITE_TOKEN ? '(set)' : '(unset)',
     collectorMode: e.COLLECTOR_MODE,
     collectorEnabled: e.COLLECTOR_ENABLED,
@@ -176,4 +208,16 @@ export function gitCommitSha(e: Env = env()): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Connection string for administrative work: migrations, partition
+ * maintenance, DETACH PARTITION CONCURRENTLY and archive maintenance.
+ *
+ * Neon's pooler is a transaction pooler, so session-level behaviour and some
+ * DDL do not survive it. Falls back to DATABASE_URL when no direct URL is
+ * configured, which is correct for a plain single-endpoint Postgres.
+ */
+export function adminDatabaseUrl(e: Env = env()): string {
+  return e.DIRECT_DATABASE_URL || e.DATABASE_URL;
 }

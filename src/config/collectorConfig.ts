@@ -170,10 +170,15 @@ export const DEFAULT_COLLECTOR_CONFIG: CollectorConfig = CollectorConfigSchema.p
     },
   ],
   capture: {},
+  // 60s only. These grids are for dashboards, health checks and sanity
+  // queries -- NOT a research source of truth. Research horizons are
+  // materialized offline from the delta stream, which is both far cheaper and
+  // far more flexible: no single sampling frequency suits event-time studies,
+  // 10ms microprice work and slow inventory strategies at once.
   sampling: {
-    bboIntervalsMs: [1000, 5000, 60_000],
-    fullBookIntervalsMs: [5000, 60_000],
-    eventLadderIntervalsMs: [1000, 5000, 60_000],
+    bboIntervalsMs: [60_000],
+    fullBookIntervalsMs: [60_000],
+    eventLadderIntervalsMs: [60_000],
   },
   validation: {},
   retention: {},

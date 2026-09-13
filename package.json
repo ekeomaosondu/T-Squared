@@ -25,9 +25,11 @@
     "soak:verify": "tsx scripts/soakVerify.ts",
     "restore": "tsx scripts/restore.ts",
     "integrity": "tsx scripts/integrityCheck.ts",
-    "integrity:full": "tsx scripts/integrityCheck.ts --full"
+    "integrity:full": "tsx scripts/integrityCheck.ts --full",
+    "materialize": "tsx scripts/materialize.ts"
   },
   "dependencies": {
+    "@duckdb/node-api": "^1.5.5-r.5",
     "@vercel/blob": "^2.8.0",
     "decimal.js": "^10.6.0",
     "dotenv": "^17.4.2",
