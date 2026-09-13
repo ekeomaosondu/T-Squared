@@ -54,6 +54,8 @@ const EnvSchema = z.object({
   RAW_ARCHIVE_ENABLED: bool(true),
   RAW_PARTITION_AHEAD_DAYS: int(7),
   RAW_PARTITION_MAINTENANCE_INTERVAL_MS: int(3_600_000),
+  /** How often the archive worker seals, uploads and verifies partitions. */
+  ARCHIVE_INTERVAL_MS: int(3_600_000),
 
   DB_BATCH_MAX_ROWS: int(500),
   DB_BATCH_MAX_WAIT_MS: int(250),

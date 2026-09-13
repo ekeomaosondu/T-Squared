@@ -49,3 +49,5 @@ next-env.d.ts
 config/collector.json
 # Export CLI output.
 /exports/
+# Local archive backend output (dev only).
+/.archive/

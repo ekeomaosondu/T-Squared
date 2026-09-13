@@ -18,6 +18,8 @@ import {
 } from '@/src/integrity/healthMetrics';
 import { BatchWriter } from '@/src/persistence/batchWriter';
 import type { Sql } from '@/src/persistence/db';
+import { ArchiveWorker } from '@/src/persistence/archive';
+import { selectArchiveStore } from '@/src/persistence/archiveStore';
 import { ensureRawPartitions } from '@/src/persistence/partitions';
 import { integrityRow, recordIntegrityEvent } from '@/src/persistence/repositories/integrity';
 import { loadEventLadders } from '@/src/persistence/repositories/metadata';
@@ -73,6 +75,7 @@ export class SessionRunner extends EventEmitter {
   readonly validator: BookValidator;
   readonly bookSampler: BookSampler;
   readonly ladderSampler: LadderSampler;
+  readonly archiver: ArchiveWorker | null;
 
   private readonly sql: Sql;
   private readonly env: Env;
@@ -155,6 +158,29 @@ export class SessionRunner extends EventEmitter {
       marketState: this.collector.marketState,
       intervalsMs: opts.config.sampling.eventLadderIntervalsMs,
     });
+
+    // Archival is best-effort at construction: a misconfigured store must not
+    // stop the recorder from capturing. It will refuse to DROP anything either
+    // way, since retention is gated separately.
+    let archiver: ArchiveWorker | null = null;
+    try {
+      const { store } = selectArchiveStore({
+        blobToken: opts.env.BLOB_READ_WRITE_TOKEN,
+        mode: opts.mode,
+      });
+      archiver = new ArchiveWorker({
+        sql: opts.sql,
+        store,
+        retentionHours: opts.env.RAW_DB_RETENTION_HOURS,
+        retentionEnabled: opts.env.RAW_DB_RETENTION_ENABLED,
+      });
+    } catch (err) {
+      logger.error(
+        { event: 'archiver_unavailable', err: String(err) },
+        'archiving is disabled; raw partitions will accumulate until this is fixed',
+      );
+    }
+    this.archiver = archiver;
 
     this.collector.on('latency', (exchangeTsMs: bigint, receivedAtMs: bigint) => {
       this.observeLatency(exchangeTsMs, receivedAtMs);
@@ -281,6 +307,9 @@ export class SessionRunner extends EventEmitter {
     every(this.env.MARKET_DISCOVERY_INTERVAL_MS, () => this.runDiscovery(), 'discovery');
     every(this.config.validation.restOrderbookIntervalMs, () => this.runValidation(), 'validation');
     every(this.env.RAW_PARTITION_MAINTENANCE_INTERVAL_MS, () => this.runPartitionMaintenance(), 'partitions');
+    if (this.archiver && this.env.RAW_ARCHIVE_ENABLED) {
+      every(this.env.ARCHIVE_INTERVAL_MS, () => this.runArchive(), 'archive');
+    }
     every(60_000, () => this.rollMinute(), 'health');
 
     // Sampling ticks at the finest configured interval and each sampler
@@ -488,6 +517,39 @@ export class SessionRunner extends EventEmitter {
       ]);
       await this.ws.close(4000, 'validation escalation').catch(() => {});
       await this.ws.connect().catch(() => {});
+    }
+  }
+
+  /**
+   * Seals, uploads and verifies completed partitions. Dropping is gated
+   * separately by RAW_DB_RETENTION_ENABLED and only ever touches a partition
+   * whose archive verified.
+   */
+  private async runArchive(): Promise<void> {
+    if (!this.archiver) return;
+
+    const result = await this.archiver.run();
+    if (result.failed.length > 0) {
+      for (const f of result.failed) {
+        await recordIntegrityEvent(this.sql, {
+          sessionId: this.sessionId,
+          type: 'db_write_failure',
+          severity: 'error',
+          details: { stage: 'archive', partition: f.partition, error: f.error },
+        }).catch(() => {});
+      }
+    }
+    if (result.archived.length || result.verified.length || result.dropped.length) {
+      logger.info(
+        {
+          event: 'archive_run',
+          archived: result.archived.length,
+          verified: result.verified.length,
+          dropped: result.dropped.length,
+          failed: result.failed.length,
+        },
+        'archive run complete',
+      );
     }
   }
 
