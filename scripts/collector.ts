@@ -3,6 +3,7 @@ import '@/src/config/bootstrap';
 import { loadCollectorConfig } from '@/src/config/collectorConfig';
 import { env, redactedEnv } from '@/src/config/env';
 import { SessionRunner } from '@/src/collector/session';
+import { startHealthServer } from '@/src/collector/healthServer';
 import { closeDb, db } from '@/src/persistence/db';
 import { migrate } from '@/src/persistence/migrate';
 import { logger } from '@/src/logging/logger';
@@ -52,6 +53,13 @@ async function main(): Promise<void> {
   );
 
   const runner = new SessionRunner({ sql, env: e, config, mode: 'daemon' });
+
+  // A remote host needs something to probe. Without it the only signal is
+  // "the process is running", and a collector can be running while recording
+  // nothing at all.
+  if (e.HEALTH_PORT > 0) {
+    startHealthServer({ port: e.HEALTH_PORT, sql, env: e, runner: () => runner });
+  }
 
   runner.on('ready', ({ sessionId, trackedMarkets }) => {
     logger.info(

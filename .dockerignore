@@ -1,0 +1,17 @@
+node_modules
+.next
+.git
+.github
+.vercel
+.env
+.env.*
+!.env.example
+.archive
+.spool
+research
+exports
+tests
+app
+public
+*.md
+docker-compose.yml

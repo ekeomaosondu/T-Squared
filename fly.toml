@@ -1,0 +1,48 @@
+# Fly.io deployment for the collector daemon.
+#
+# A WebSocket recorder must stay connected, so this is deliberately a single
+# always-on machine with autostop disabled. Two machines would double-subscribe
+# and produce two sequence epochs for the same markets.
+
+app = "kalshi-market-recorder"
+primary_region = "iad"   # us-east, near Kalshi's API and the Neon region
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  COLLECTOR_MODE = "daemon"
+  DEPLOYMENT_ENV = "production"
+  HEALTH_PORT = "8080"
+  LOG_LEVEL = "info"
+  LOG_PRETTY = "false"
+  # Both stay false until one real partition passes
+  # archive -> R2 verification -> restore -> replay equality.
+  RAW_DB_RETENTION_ENABLED = "false"
+  NORMALIZED_RETENTION_ENABLED = "false"
+
+# Exactly one collector. Never scale this beyond 1.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Never suspend: suspending the machine stops the WebSocket and loses
+  # market data, which is the one thing this system exists to prevent.
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "60s"
+    interval = "30s"
+    method = "GET"
+    timeout = "10s"
+    path = "/live"
+
+[deploy]
+  # Stop the old machine before starting the new one, so two collectors never
+  # hold subscriptions for the same markets at once.
+  strategy = "immediate"

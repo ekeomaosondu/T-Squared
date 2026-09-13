@@ -73,6 +73,9 @@ const EnvSchema = z.object({
   DB_BATCH_MAX_WAIT_MS: int(250),
   DB_BUFFER_MAX_ROWS: int(200_000),
 
+  /** Health endpoint port for the daemon. 0 disables it. */
+  HEALTH_PORT: int(8080),
+
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']).default('info'),
   LOG_PRETTY: bool(false),
 
