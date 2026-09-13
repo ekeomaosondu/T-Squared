@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { one, type Sql } from '@/src/persistence/db';
 import { sha256, type ArchiveStore } from '@/src/persistence/archiveStore';
+import { describeViolations, validateSilverFile } from '@/src/persistence/silverContract';
 import { logger } from '@/src/logging/logger';
 
 /**
@@ -353,6 +354,15 @@ export class SilverExporter {
 
     const counted = await conn.runAndReadAll(`SELECT count(*) AS n FROM read_parquet('${esc(parquet)}')`);
     const exported = Number((counted.getRowObjects()[0] as { n: unknown }).n);
+
+    // Contract gate. Type drift does not fail loudly on its own: an ordering
+    // key that becomes VARCHAR still queries fine while sorting 100 before 99,
+    // and a price that becomes DOUBLE looks like microstructure. So the file is
+    // rejected here rather than published and trusted.
+    const violations = await validateSilverFile(conn, parquet);
+    if (violations.length > 0) {
+      throw new Error(`silver contract violation: ${describeViolations(violations)}`);
+    }
 
     const body = await readFile(parquet);
     await this.store.put(objectPath, body);

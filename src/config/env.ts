@@ -52,6 +52,18 @@ const EnvSchema = z.object({
    */
   RAW_DB_RETENTION_ENABLED: bool(false),
   RAW_ARCHIVE_ENABLED: bool(true),
+
+  /**
+   * Destructive expiry of NORMALIZED rows (deltas, trades, ticker, snapshots)
+   * from Postgres after their silver Parquet is verified.
+   *
+   * Also false by default. Once on, Neon holds only enough recent normalized
+   * data for debugging and live operation; the multi-week research dataset
+   * lives in R2, typed and directly queryable, and is rebuildable from bronze.
+   */
+  NORMALIZED_RETENTION_ENABLED: bool(false),
+  /** Days of normalized data to keep hot in Postgres. */
+  NORMALIZED_RETENTION_DAYS: int(3),
   RAW_PARTITION_AHEAD_DAYS: int(7),
   RAW_PARTITION_MAINTENANCE_INTERVAL_MS: int(3_600_000),
   /** How often the archive worker seals, uploads and verifies partitions. */

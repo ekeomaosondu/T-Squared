@@ -90,8 +90,16 @@ async function main(): Promise<void> {
     for (const f of result.failed) console.log(`  ${day}  FAILED ${f.table}: ${f.error}`);
 
     if (argv.includes('--expire')) {
-      const enabled = process.env.NORMALIZED_RETENTION_ENABLED === 'true';
-      const out = await exporter.expireDay(day, { enabled });
+      // Only days older than the hot window are eligible; recent normalized
+      // data stays in Postgres for debugging and live operation.
+      const cutoff = new Date(Date.now() - e.NORMALIZED_RETENTION_DAYS * 86_400_000)
+        .toISOString()
+        .slice(0, 10);
+      const withinHotWindow = day >= cutoff;
+
+      const out = withinHotWindow
+        ? { deleted: 0, reason: `within the ${e.NORMALIZED_RETENTION_DAYS}-day hot window` }
+        : await exporter.expireDay(day, { enabled: e.NORMALIZED_RETENTION_ENABLED });
       console.log(
         out.deleted > 0
           ? `  ${day}  expired ${out.deleted} normalized row(s) from Postgres`

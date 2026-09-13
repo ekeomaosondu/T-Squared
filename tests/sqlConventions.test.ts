@@ -26,12 +26,20 @@ function sourceFiles(dir: string): string[] {
 
 const files = ROOTS.flatMap((r) => sourceFiles(path.join(process.cwd(), r)));
 
-/** Strips line comments so prose about the rule is not flagged as a violation. */
+/**
+ * Strips comments and single/double-quoted string literals.
+ *
+ * All SQL in this codebase lives in template literals, so prose in an ordinary
+ * string -- an error message mentioning "ORDER BY", for instance -- is not SQL
+ * and must not be flagged.
+ */
 function stripComments(text: string): string {
-  return text
+  const withoutComments = text
     .split('\n')
     .filter((l) => !l.trim().startsWith('*') && !l.trim().startsWith('//') && !l.trim().startsWith('/*'))
     .join('\n');
+
+  return withoutComments.replace(/'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"/g, "''");
 }
 
 describe('SQL ordering conventions', () => {
