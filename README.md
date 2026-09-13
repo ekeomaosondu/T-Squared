@@ -619,6 +619,91 @@ an exact TTL: with daily partitions the effective retention is between that and
 
 ---
 
+## Going live
+
+The launch gate is one sentence: **one real partition archives, verifies,
+restores and replays exactly. Then enable retention.**
+
+```bash
+# 1. Start with retention disabled. Nothing can be deleted.
+RAW_DB_RETENTION_ENABLED=false npm run collector
+
+# 2. Let the first UTC daily partition close naturally. Do not manufacture it.
+
+# 3. Run the real archival flow: seal -> archive -> verify rows -> verify sha256
+npm run archive
+npm run archive -- --status
+
+# 4. Restore that partition into a scratch database and reconstruct from it.
+#    This is the acceptance criterion, not step 3.
+npm run restore -- --partition raw_ingest_events_YYYY_MM_DD
+
+# 5. Only after step 4 passes, enable retention.
+#    The first deletion is then a partition already proven restorable.
+RAW_DB_RETENTION_ENABLED=true
+```
+
+Archive verification proves `bytes written == bytes read`. Step 4 proves what
+actually matters:
+
+```
+archived bytes -> restore -> parse -> normalize -> replay -> exact book state
+```
+
+`npm run restore` replays every archived frame through the **real collector**
+into a scratch database and compares the result against the snapshots the live
+recorder wrote at the time. It exits non-zero unless every one reconstructs
+exactly.
+
+### Ongoing
+
+```bash
+npm run integrity          # daily: health, gaps, ordinal holes, archive
+                           # status, validation counts, coverage, sampled replay
+npm run integrity:full     # weekly: replay every market in the window
+```
+
+Both exit non-zero on `CRITICAL` or any replay mismatch, so cron only speaks up
+when it matters.
+
+### Monitoring
+
+`GET /api/health` returns a single level, with HTTP status mirroring it:
+
+| Level | HTTP | Meaning |
+|---|---|---|
+| `HEALTHY` | 200 | nothing to do |
+| `DEGRADED` | 200 | needs attention; history still being captured correctly |
+| `CRITICAL` | 503 | dataset is being damaged or is not being collected |
+
+`CRITICAL` is raised by: stale or absent collector heartbeat, an
+`ingest_ordinal` hole (a frame observed but never persisted), an unrecovered
+sequence gap, partition runway under two days, or failing database writes. An
+overdue archive is `DEGRADED` while retention is disabled and `CRITICAL` once it
+is enabled, because unarchived data is then one job away from deletion.
+
+`GET /api/collector/status` gives the detail behind it, including series
+coverage.
+
+### Series coverage
+
+A configured series that has never listed a market looks identical to one the
+recorder is silently failing on, so the two are tracked apart:
+
+```
+KXHIGHNY   exercised               markets=12
+KXHIGHLAX  exercised               markets=12
+KXLOWNY    awaiting_first_market   markets=0
+KXLOWLAX   awaiting_first_market   markets=0
+```
+
+The low-temperature series are seasonal and currently list nothing. When they
+first appear, treat it as a small production test: confirm discovery,
+subscription, initial snapshots, synchronized ladder samples, REST validation
+and replay. The first listing is logged as `series_first_subscribed`.
+
+---
+
 ## Soak testing
 
 A clean run proves normal operation. This deliberately makes operation abnormal:
