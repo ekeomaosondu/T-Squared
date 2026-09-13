@@ -4,7 +4,7 @@ import { Collector } from '@/src/collector/collector';
 import { UniverseManager } from '@/src/collector/universeManager';
 import type { CollectorConfig } from '@/src/config/collectorConfig';
 import { configHash } from '@/src/config/collectorConfig';
-import type { Env } from '@/src/config/env';
+import { gitCommitSha, type Env } from '@/src/config/env';
 import { KalshiSigner } from '@/src/kalshi/auth';
 import { KalshiRestClient } from '@/src/kalshi/restClient';
 import { KalshiWebSocketClient } from '@/src/kalshi/websocketClient';
@@ -244,7 +244,7 @@ export class SessionRunner extends EventEmitter {
       configHash: configHash(this.config),
       wsUrl: this.ws.url,
       vercelDeploymentId: this.env.VERCEL_DEPLOYMENT_ID || null,
-      gitCommitSha: this.env.VERCEL_GIT_COMMIT_SHA || null,
+      gitCommitSha: gitCommitSha(this.env),
       instanceId: this.env.VERCEL_REGION || null,
     });
     this.sessionPersisted = true;

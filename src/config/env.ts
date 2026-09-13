@@ -149,3 +149,31 @@ export const KALSHI_ENDPOINTS = {
 export function kalshiEndpoints(e: Env = env()) {
   return KALSHI_ENDPOINTS[e.KALSHI_ENV];
 }
+
+/**
+ * The commit this process is running.
+ *
+ * Vercel supplies VERCEL_GIT_COMMIT_SHA; in daemon mode it is read from the
+ * working tree. Recorded on every collector session so a window of the dataset
+ * can be tied to the exact code that produced it -- which matters when a
+ * parsing or reconstruction change lands mid-collection.
+ *
+ * A dirty working tree is marked, because "the deployed SHA" is then a claim
+ * that is not quite true.
+ */
+export function gitCommitSha(e: Env = env()): string | null {
+  if (e.VERCEL_GIT_COMMIT_SHA) return e.VERCEL_GIT_COMMIT_SHA;
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { execFileSync } = require('node:child_process') as typeof import('node:child_process');
+    const run = (args: string[]) =>
+      execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+
+    const sha = run(['rev-parse', 'HEAD']);
+    const dirty = run(['status', '--porcelain']).length > 0;
+    return dirty ? `${sha}-dirty` : sha;
+  } catch {
+    return null;
+  }
+}
