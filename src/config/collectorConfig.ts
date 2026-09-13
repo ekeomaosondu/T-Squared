@@ -93,7 +93,14 @@ export const CollectorConfigSchema = z.object({
   validation: z
     .object({
       restOrderbookIntervalMs: z.number().int().positive().default(60_000),
-      maxMarketsPerValidationBatch: z.number().int().positive().default(50),
+      maxMarketsPerValidationBatch: z.number().int().positive().default(100),
+      /**
+       * How far either side of the REST request window a local book state may
+       * lie and still count as agreement. Absorbs clock skew and REST-side
+       * staleness; without it, any actively traded market looks like a
+       * mismatch.
+       */
+      matchToleranceMs: z.number().int().nonnegative().default(2_000),
     })
     .prefault({}),
 

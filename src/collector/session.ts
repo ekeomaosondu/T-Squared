@@ -32,6 +32,9 @@ import { BookSampler } from '@/src/sampling/bookSampler';
 import { LadderSampler } from '@/src/sampling/ladderSampler';
 import { logger } from '@/src/logging/logger';
 
+/** Delay before confirming a transient REST mismatch with a second check. */
+const VALIDATION_RECHECK_DELAY_MS = 1_500;
+
 /**
  * One capture epoch, start to finish.
  *
@@ -133,6 +136,7 @@ export class SessionRunner extends EventEmitter {
       rest: this.rest,
       books: this.collector.books,
       maxMarketsPerBatch: opts.config.validation.maxMarketsPerValidationBatch,
+      toleranceMs: opts.config.validation.matchToleranceMs,
     });
 
     this.bookSampler = new BookSampler({
@@ -402,26 +406,49 @@ export class SessionRunner extends EventEmitter {
   private async runValidation(): Promise<void> {
     const outcome = await this.validator.validate(this.universe.trackedTickers, this.sessionId);
     if (outcome.rows.length > 0) this.writer.enqueueDerived(outcome.rows);
-    this.minute.validationMismatches += outcome.mismatched.length;
 
-    // A mismatch asks the WEBSOCKET for a fresh snapshot; the live book is
-    // never replaced directly from REST.
+    // Only confirmed mismatches count as data-quality incidents. A book that
+    // matched a state it genuinely held during the request window is correct.
+    this.minute.validationMismatches += outcome.confirmed;
+
+    // A confirmed mismatch asks the WEBSOCKET for a fresh snapshot; the live
+    // book is never replaced directly from REST.
     if (outcome.recoveryNeeded.length > 0) {
-      this.collector.subscriptions.requestSnapshots(outcome.recoveryNeeded, 'orderbook_delta');
+      this.collector.requestRecoverySnapshots(outcome.recoveryNeeded, 'rest_validation_mismatch');
     }
 
-    // Only if that repeatedly fails do we reconnect the session.
+    // Re-check transient mismatches promptly rather than waiting a full
+    // interval, so a real divergence is confirmed quickly.
+    const pending = this.validator.awaitingRecheck;
+    if (pending.length > 0) {
+      setTimeout(() => {
+        void this.validator
+          .validate(pending, this.sessionId)
+          .then((second) => {
+            if (second.rows.length > 0) this.writer.enqueueDerived(second.rows);
+            this.minute.validationMismatches += second.confirmed;
+            if (second.recoveryNeeded.length > 0) {
+              this.collector.requestRecoverySnapshots(second.recoveryNeeded, 'rest_validation_mismatch');
+            }
+          })
+          .catch((err) =>
+            logger.warn({ event: 'validation_recheck_failed', err: String(err) }, 'validation re-check failed'),
+          );
+      }, VALIDATION_RECHECK_DELAY_MS).unref?.();
+    }
+
+    // Only if confirmed mismatches persist do we reconnect the session.
     if (outcome.escalate) {
       logger.error(
-        { event: 'validation_escalation', mismatched: outcome.mismatched.length },
-        'persistent REST mismatches; reconnecting websocket',
+        { event: 'validation_escalation', confirmed: outcome.confirmed },
+        'persistent confirmed REST mismatches; reconnecting websocket',
       );
       this.writer.enqueueDerived([
         integrityRow({
           sessionId: this.sessionId,
           type: 'rest_snapshot_mismatch',
           severity: 'critical',
-          details: { action: 'reconnect', markets: outcome.mismatched },
+          details: { action: 'reconnect', markets: outcome.recoveryNeeded },
         }),
       ]);
       await this.ws.close(4000, 'validation escalation').catch(() => {});

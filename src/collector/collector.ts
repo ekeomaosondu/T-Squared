@@ -179,6 +179,22 @@ export class Collector extends EventEmitter {
     this.config = config;
   }
 
+  /**
+   * Requests fresh snapshots for specific markets, subject to the per-market
+   * cooldown. The single entry point for any caller outside the frame path.
+   */
+  requestRecoverySnapshots(markets: string[], reason: string): number {
+    const allowed = markets.filter((m) => this.mayRequestSnapshot(m));
+    if (allowed.length === 0) return 0;
+
+    const requested = this.subscriptions.requestSnapshots(allowed, 'orderbook_delta');
+    logger.info(
+      { event: 'recovery_snapshots_requested', reason, requested, suppressed: markets.length - allowed.length },
+      'requested recovery snapshots',
+    );
+    return requested;
+  }
+
   /** Rate-limits per-market snapshot requests so recovery cannot self-amplify. */
   private mayRequestSnapshot(marketTicker: string, nowMs = Date.now()): boolean {
     const last = this.lastSnapshotRequestAt.get(marketTicker) ?? 0;

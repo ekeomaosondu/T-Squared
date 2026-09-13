@@ -72,6 +72,26 @@ export interface CanonicalBook {
   no_bids: [string, string][];
 }
 
+/**
+ * A recently applied delta, retained so that a past book state can be
+ * reconstructed by un-applying deltas backwards.
+ *
+ * This exists for REST validation. A REST snapshot is created somewhere between
+ * our request and our receipt of the response, so comparing it against the book
+ * "now" reports a mismatch on any actively traded market. Keeping this journal
+ * costs one small object per delta on the hot path; the alternative -- hashing
+ * the book on every mutation so recent hashes are on hand -- would serialise
+ * and SHA-256 the entire ladder thousands of times a second.
+ */
+export interface JournalEntry {
+  seq: bigint | null;
+  atMs: number;
+  side: BookSide;
+  price: string;
+  /** The signed change that was applied; un-applying negates it. */
+  delta: Decimal;
+}
+
 /** Thrown when a delta would drive a level's resting quantity below zero. */
 export class NegativeLevelQuantityError extends Error {
   constructor(
@@ -117,8 +137,15 @@ export class MarketBook {
 
   private hashCache: string | null = null;
 
-  constructor(marketTicker: string) {
+  /** Bounded ring of recently applied deltas, oldest first. */
+  private journal: JournalEntry[] = [];
+  private journalWindowMs: number;
+  private journalMaxEntries: number;
+
+  constructor(marketTicker: string, opts: { journalWindowMs?: number; journalMaxEntries?: number } = {}) {
     this.marketTicker = marketTicker;
+    this.journalWindowMs = opts.journalWindowMs ?? 10_000;
+    this.journalMaxEntries = opts.journalMaxEntries ?? 2048;
   }
 
   // -------------------------------------------------------------------------
@@ -144,6 +171,9 @@ export class MarketBook {
     this.invalidReason = null;
     this.lastSnapshotAtMs = opts.atMs ?? Date.now();
     this.lastUpdateAtMs = this.lastSnapshotAtMs;
+    // A snapshot is a hard reset: journalled deltas no longer describe how this
+    // state was reached, so rewinding past it would be fiction.
+    this.journal = [];
     if (opts.sessionId !== undefined) this.sessionId = opts.sessionId;
     if (opts.streamId !== undefined) this.streamId = opts.streamId;
     this.hashCache = null;
@@ -203,10 +233,68 @@ export class MarketBook {
     else map.set(priceKey, post);
 
     if (input.seq !== undefined && input.seq !== null) this.lastSeq = input.seq;
-    this.lastUpdateAtMs = input.atMs ?? Date.now();
+    const atMs = input.atMs ?? Date.now();
+    this.lastUpdateAtMs = atMs;
     this.hashCache = null;
 
+    this.journal.push({ seq: input.seq ?? null, atMs, side, price: priceKey, delta });
+    this.trimJournal(atMs);
+
     return { applied: true, preCount: pre, postCount: post, levelAction };
+  }
+
+  private trimJournal(nowMs: number): void {
+    const cutoff = nowMs - this.journalWindowMs;
+    let drop = 0;
+    while (drop < this.journal.length && this.journal[drop]!.atMs < cutoff) drop += 1;
+    if (drop > 0) this.journal = this.journal.slice(drop);
+    if (this.journal.length > this.journalMaxEntries) {
+      this.journal = this.journal.slice(this.journal.length - this.journalMaxEntries);
+    }
+  }
+
+  /** Oldest instant this book can be rewound to, or null if the journal is empty. */
+  get earliestJournalMs(): number | null {
+    return this.journal[0]?.atMs ?? null;
+  }
+
+  get journalSize(): number {
+    return this.journal.length;
+  }
+
+  /**
+   * Every distinct state this book passed through at or after `fromMs`, newest
+   * first, reconstructed by un-applying journalled deltas.
+   *
+   * Element 0 is the current state. Used only when a REST comparison fails, so
+   * the hashing cost is paid on mismatches rather than on every delta.
+   */
+  historicalStates(fromMs: number, maxStates = 64): { atMs: number; seq: bigint | null; hash: string }[] {
+    const out: { atMs: number; seq: bigint | null; hash: string }[] = [];
+    const rewound = this.clone();
+
+    out.push({ atMs: this.lastUpdateAtMs, seq: this.lastSeq, hash: rewound.getStateHash() });
+
+    for (let i = this.journal.length - 1; i >= 0 && out.length < maxStates; i--) {
+      const entry = this.journal[i]!;
+      if (entry.atMs < fromMs) break;
+
+      // Un-apply: subtract the delta that was added.
+      const map = entry.side === 'yes' ? rewound.yesBids : rewound.noBids;
+      const current = map.get(entry.price) ?? ZERO;
+      const before = current.minus(entry.delta);
+      if (before.isNegative()) break; // cannot rewind further coherently
+      if (before.isZero()) map.delete(entry.price);
+      else map.set(entry.price, before);
+
+      rewound.hashCache = null;
+      rewound.lastSeq = i > 0 ? this.journal[i - 1]!.seq : null;
+
+      const priorMs = i > 0 ? this.journal[i - 1]!.atMs : entry.atMs;
+      out.push({ atMs: priorMs, seq: rewound.lastSeq, hash: rewound.getStateHash() });
+    }
+
+    return out;
   }
 
   /** Marks the book untrustworthy. State is retained for diagnostics. */
@@ -327,7 +415,10 @@ export class MarketBook {
 
   /** Deep copy, used for synchronised ladder sampling and for tests. */
   clone(): MarketBook {
-    const copy = new MarketBook(this.marketTicker);
+    const copy = new MarketBook(this.marketTicker, {
+      journalWindowMs: this.journalWindowMs,
+      journalMaxEntries: this.journalMaxEntries,
+    });
     for (const [k, v] of this.yesBids) copy.yesBids.set(k, v);
     for (const [k, v] of this.noBids) copy.noBids.set(k, v);
     copy.lastSeq = this.lastSeq;
