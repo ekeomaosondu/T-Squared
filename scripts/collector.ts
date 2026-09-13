@@ -21,6 +21,30 @@ import { logger } from '@/src/logging/logger';
  * until the process is signalled.
  */
 
+/**
+ * Retries database work with backoff instead of exiting.
+ *
+ * A container that dies on a transient database outage takes its health
+ * endpoint with it, so the operator sees a crash-loop rather than a clear
+ * "database unreachable". Failures are logged at ERROR every attempt, so a
+ * genuinely misconfigured URL is still obvious.
+ */
+async function withDatabaseRetry<T>(fn: () => Promise<T>, maxAttempts = 60): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt >= maxAttempts) throw err;
+      const delayMs = Math.min(30_000, 1000 * 2 ** Math.min(attempt - 1, 5));
+      logger.error(
+        { event: 'database_unavailable', attempt, delayMs, err: String(err) },
+        'database unavailable at startup; retrying (health endpoint is serving)',
+      );
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const e = env();
   logger.info({ event: 'collector_boot', ...redactedEnv(e) }, 'starting collector daemon');
@@ -37,8 +61,22 @@ async function main(): Promise<void> {
   }
 
   const sql = db();
-  // Migrating on boot keeps a fresh VM or container self-sufficient.
-  await migrate(sql);
+
+  // The health endpoint comes up BEFORE any database work.
+  //
+  // On a remote host, a database that is unreachable at startup must not turn
+  // into a crash-loop with no diagnostics. /live answers immediately, /health
+  // reports CRITICAL, and the orchestrator can tell "alive but the database is
+  // down" apart from "the image is broken".
+  let runnerRef: SessionRunner | null = null;
+  if (e.HEALTH_PORT > 0) {
+    startHealthServer({ port: e.HEALTH_PORT, sql, env: e, runner: () => runnerRef });
+  }
+
+  // Migrating on boot keeps a fresh VM or container self-sufficient. A
+  // transient database outage is retried rather than exiting, because exiting
+  // loses the health endpoint too.
+  await withDatabaseRetry(() => migrate(sql));
 
   const config = await loadCollectorConfig(e.COLLECTOR_CONFIG_PATH);
   logger.info(
@@ -53,13 +91,7 @@ async function main(): Promise<void> {
   );
 
   const runner = new SessionRunner({ sql, env: e, config, mode: 'daemon' });
-
-  // A remote host needs something to probe. Without it the only signal is
-  // "the process is running", and a collector can be running while recording
-  // nothing at all.
-  if (e.HEALTH_PORT > 0) {
-    startHealthServer({ port: e.HEALTH_PORT, sql, env: e, runner: () => runner });
-  }
+  runnerRef = runner;
 
   runner.on('ready', ({ sessionId, trackedMarkets }) => {
     logger.info(

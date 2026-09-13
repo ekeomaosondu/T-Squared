@@ -61,6 +61,33 @@ async function main(): Promise<void> {
     }
   }
 
+  // ---- capture gaps ------------------------------------------------------
+  const gaps = (await sql`
+    SELECT g.started_at, g.ended_at, g.duration_ms::text AS duration_ms_text, g.reason,
+           g.prior_end_reason
+      FROM capture_gaps g
+     WHERE g.started_at > now() - make_interval(hours => ${hours})
+     ORDER BY g.started_at DESC
+  `) as unknown as {
+    started_at: Date; ended_at: Date | null; duration_ms_text: string | null;
+    reason: string; prior_end_reason: string | null;
+  }[];
+
+  if (gaps.length > 0) {
+    console.log(`\n=== capture gaps (last ${hours}h) ===\n`);
+    for (const g of gaps) {
+      const secs = g.duration_ms_text === null ? 'ongoing' : `${Math.round(Number(g.duration_ms_text) / 1000)}s`;
+      console.log(
+        `  ${g.started_at.toISOString()}  ${String(g.reason).padEnd(9)} ${secs.padStart(9)}` +
+          (g.prior_end_reason ? `  (prior end_reason: ${g.prior_end_reason})` : '  (prior session did not shut down cleanly)'),
+      );
+    }
+    // Not a failure: a recorded gap is the system working. An UNrecorded one
+    // would be the problem, and is what this table exists to prevent.
+    console.log('\n  These intervals had no coverage. Absence of events there is not');
+    console.log('  absence of market activity, and backtests must exclude them.');
+  }
+
   // ---- archive -----------------------------------------------------------
   const archives = (await sql`
     SELECT s.partition_name, s.status, s.sealed_row_count, s.archived_row_count, s.verified_at

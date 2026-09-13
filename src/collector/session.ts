@@ -22,6 +22,7 @@ import { ArchiveWorker } from '@/src/persistence/archive';
 import { selectArchiveStore } from '@/src/persistence/archiveStore';
 import { ensureRawPartitions } from '@/src/persistence/partitions';
 import { integrityRow, recordIntegrityEvent } from '@/src/persistence/repositories/integrity';
+import { closeCaptureGap, openCaptureGap } from '@/src/persistence/repositories/captureGaps';
 import { loadEventLadders } from '@/src/persistence/repositories/metadata';
 import {
   bumpSessionCounters,
@@ -90,6 +91,8 @@ export class SessionRunner extends EventEmitter {
   private sessionPersisted = false;
   private discovered = false;
   private pendingDiscoveryTimer: NodeJS.Timeout | null = null;
+  /** Open capture gap awaiting the first valid snapshot of this session. */
+  private openGapId: string | null = null;
 
   constructor(opts: SessionRunnerOptions) {
     super();
@@ -194,6 +197,15 @@ export class SessionRunner extends EventEmitter {
       this.observeLatency(exchangeTsMs, receivedAtMs);
     });
 
+    // Coverage resumes when we hold book state we can vouch for, not merely
+    // when bytes start arriving -- so the gap closes at the first snapshot.
+    this.collector.on('firstSnapshot', (at: Date) => {
+      const gapId = this.openGapId;
+      if (!gapId) return;
+      this.openGapId = null;
+      void closeCaptureGap(this.sql, gapId, at).catch(() => {});
+    });
+
     // A lifecycle message can announce a new daily ladder. Pull discovery
     // forward rather than waiting up to MARKET_DISCOVERY_INTERVAL_MS, while
     // debouncing so a burst of lifecycle events causes one refresh.
@@ -257,8 +269,17 @@ export class SessionRunner extends EventEmitter {
     });
     this.sessionPersisted = true;
 
+    // Record the interval since the previous session stopped observing.
+    // Without this, a deployment hole looks like a quiet market to any future
+    // backtest reading the delta stream.
+    this.openGapId = await openCaptureGap(this.sql, {
+      datasetId: this.env.DATASET_ID,
+      newSessionId: this.sessionId,
+      deployHint: process.env.DEPLOY_BOUNDARY === 'true',
+    }).catch(() => null);
+
     logger.info(
-      { event: 'session_started', session_id: this.sessionId, mode: this.mode },
+      { event: 'session_started', session_id: this.sessionId, mode: this.mode, capture_gap_id: this.openGapId },
       'collector session started',
     );
 

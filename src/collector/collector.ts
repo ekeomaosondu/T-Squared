@@ -145,6 +145,7 @@ export class Collector extends EventEmitter {
   private readonly lastTickerMismatchAt = new Map<string, number>();
   /** Monotonic observation counter for this session. */
   private ingestOrdinal = 0n;
+  private announcedFirstSnapshot = false;
   private readonly lastSnapshotRequestAt = new Map<string, number>();
 
   /**
@@ -767,6 +768,11 @@ export class Collector extends EventEmitter {
   ): void {
     const msg = OrderbookSnapshotMsg.parse(env.msg);
     this.counters.snapshots += 1;
+
+    if (!this.announcedFirstSnapshot) {
+      this.announcedFirstSnapshot = true;
+      this.emit('firstSnapshot', unit.raw.receivedAt);
+    }
 
     const nowMs = Number(unit.raw.receivedAtMs);
     const outcome = streamId

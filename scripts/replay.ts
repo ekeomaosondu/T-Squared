@@ -128,7 +128,17 @@ async function main() {
     appliedDeltas: result.appliedDeltas,
     skippedDeltas: result.skippedDeltas,
     sequenceGapsInWindow: result.gapsInWindow.length,
-    uninterrupted: result.gapsInWindow.length === 0 && result.epochs.length === 1,
+    // Intervals when nobody was listening at all.
+    captureGaps: result.captureGaps.map((g) => ({
+      from: g.started_at.toISOString(),
+      to: g.ended_at?.toISOString() ?? null,
+      reason: g.reason,
+      durationMs: g.duration_ms_text === null ? null : Number(g.duration_ms_text),
+    })),
+    uninterrupted:
+      result.gapsInWindow.length === 0 &&
+      result.captureGaps.length === 0 &&
+      result.epochs.length === 1,
     warnings: result.warnings,
     finalStateHash: result.finalBook?.getStateHash() ?? null,
   };

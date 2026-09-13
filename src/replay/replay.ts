@@ -2,6 +2,7 @@ import { MarketBook } from '@/src/book/book';
 import { computeFeatures } from '@/src/book/features';
 import type { Sql } from '@/src/persistence/db';
 import { findSeedSnapshot, type SnapshotRow } from '@/src/persistence/repositories/snapshots';
+import { captureGapsInWindow, type CaptureGapRow } from '@/src/persistence/repositories/captureGaps';
 import { logger } from '@/src/logging/logger';
 
 /**
@@ -102,6 +103,14 @@ export interface ReplayResult {
   totalDeltas: number;
   appliedDeltas: number;
   skippedDeltas: number;
+  /**
+   * Intervals in the window when NO collector was listening.
+   *
+   * Distinct from a sequence gap: there, the exchange sent data we missed;
+   * here, nobody was watching at all. A study must not read the resulting
+   * absence of events as an absence of market activity.
+   */
+  captureGaps: CaptureGapRow[];
   /** Recorded sequence gaps overlapping the window. */
   gapsInWindow: {
     detected_at: Date;
@@ -177,6 +186,7 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
     totalDeltas: 0,
     appliedDeltas: 0,
     skippedDeltas: 0,
+    captureGaps: [],
     gapsInWindow: [],
     warnings: [],
   };
@@ -195,6 +205,19 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
        AND g.affected_markets @> ${JSON.stringify([marketTicker])}::jsonb
      ORDER BY g.detected_at
   `;
+
+  // Intervals when NO collector was listening. Distinct from a sequence gap:
+  // there the exchange sent data we missed; here nobody was watching at all.
+  // A study must not read the resulting absence of events as an absence of
+  // market activity.
+  result.captureGaps = await captureGapsInWindow(sql, fromMs, toMs);
+  for (const gap of result.captureGaps) {
+    const until = gap.ended_at ? gap.ended_at.toISOString() : 'ongoing';
+    result.warnings.push(
+      `no coverage from ${gap.started_at.toISOString()} to ${until} (${gap.reason}); ` +
+        'absence of events in that interval does not mean absence of market activity',
+    );
+  }
 
   let seed = await findSeedSnapshot(sql, marketTicker, fromMs);
 
