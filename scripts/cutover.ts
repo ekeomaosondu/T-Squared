@@ -30,9 +30,15 @@ function step(name: string, ok: boolean, detail: string): void {
   console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(28)} ${detail}`);
 }
 
-/** Records everything needed to describe the outgoing epoch afterwards. */
-async function recordOutgoingEpoch(): Promise<void> {
-  const sql = db();
+/**
+ * Records everything needed to describe the outgoing epoch afterwards.
+ *
+ * Reads the OUTGOING database explicitly. By the time this runs, DATABASE_URL
+ * already points at the new target, so defaulting to it would report an empty
+ * new database as though it were the epoch being closed.
+ */
+async function recordOutgoingEpoch(fromUrl: string | undefined): Promise<void> {
+  const sql = fromUrl ? createDb({ connectionString: fromUrl, max: 2 }) : db();
 
   const rows = (await sql`
     SELECT c.session_id, c.mode, c.started_at, c.ended_at, c.end_reason,
@@ -43,10 +49,22 @@ async function recordOutgoingEpoch(): Promise<void> {
      LIMIT 1
   `) as unknown as Record<string, unknown>[];
 
+  const sessionId = rows[0]?.session_id as string | undefined;
+  if (!sessionId) {
+    console.log(
+      '\nNo collector sessions in the source database.\n' +
+        'If you meant to record the laptop epoch, pass it explicitly:\n' +
+        '  npm run cutover -- --record --from postgres://kalshi:kalshi@localhost:54329/kalshi_recorder\n',
+    );
+    if (fromUrl) await sql.end({ timeout: 5 });
+    else await closeDb();
+    return;
+  }
+
   const ordinal = (await sql`
     SELECT max(r.ingest_ordinal) AS last_ordinal, count(*) AS raw_rows
       FROM raw_ingest_events r
-     WHERE r.session_id = ${String(rows[0]?.session_id ?? '')}
+     WHERE r.session_id = ${sessionId}::uuid
   `) as unknown as { last_ordinal: string | null; raw_rows: string }[];
 
   const counts = (await sql`
@@ -63,7 +81,8 @@ async function recordOutgoingEpoch(): Promise<void> {
       'database at a fresh collector session.\n',
   );
 
-  await closeDb();
+  if (fromUrl) await sql.end({ timeout: 5 });
+  else await closeDb();
 }
 
 async function checkTarget(): Promise<void> {
@@ -166,13 +185,18 @@ async function checkTarget(): Promise<void> {
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  if (argv.includes('--record')) return recordOutgoingEpoch();
+  if (argv.includes('--record')) {
+    const i = argv.indexOf('--from');
+    return recordOutgoingEpoch(i === -1 ? undefined : argv[i + 1]);
+  }
   if (argv.includes('--check')) return checkTarget();
 
   console.error(
     'usage: npm run cutover -- --check | --record\n' +
       '  --check   verify the target database is ready (applies migrations)\n' +
-      '  --record  print the outgoing epoch for the record before switching',
+      '  --record  print the outgoing epoch for the record before switching\n' +
+      '            --from <url> reads a specific database; required once\n' +
+      '            DATABASE_URL already points at the new target',
   );
   process.exit(1);
 }
