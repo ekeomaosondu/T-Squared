@@ -14,6 +14,11 @@ import {
   upsertMarket,
   upsertSeries,
 } from '@/src/persistence/repositories/metadata';
+import {
+  markAwaitingFirstMarket,
+  markSubscribed,
+  registerConfiguredSeries,
+} from '@/src/persistence/repositories/coverage';
 import { logger } from '@/src/logging/logger';
 
 /**
@@ -154,6 +159,11 @@ export class UniverseManager {
           ? undefined
           : Math.floor(now.getTime() / 1000) - selector.retainAfterCloseSeconds;
 
+      // Every configured series is registered, so one that never lists a
+      // market is visibly "awaiting" rather than indistinguishable from one the
+      // recorder is silently failing on.
+      await registerConfiguredSeries(this.sql, seriesList.map((x) => x.ticker));
+
       for (const series of seriesList) {
         await upsertSeries(this.sql, series, now);
 
@@ -166,6 +176,9 @@ export class UniverseManager {
         ];
         await this.ensureEvents(eventTickers, series.ticker, now);
 
+        let eligibleForSeries = 0;
+        let lastEligible: string | null = null;
+
         for (const market of markets) {
           const seriesTicker = market.event_ticker
             ? (this.seriesByEvent.get(market.event_ticker) ?? series.ticker)
@@ -174,6 +187,8 @@ export class UniverseManager {
           await upsertMarket(this.sql, market, seriesTicker, now);
 
           if (this.isEligible(market, selector, now)) {
+            eligibleForSeries += 1;
+            lastEligible = market.ticker;
             desired.set(market.ticker, {
               marketTicker: market.ticker,
               eventTicker: market.event_ticker ?? null,
@@ -184,6 +199,12 @@ export class UniverseManager {
               closeTime: market.close_time ? new Date(market.close_time) : null,
             });
           }
+        }
+
+        if (eligibleForSeries > 0 && lastEligible) {
+          await markSubscribed(this.sql, series.ticker, lastEligible, eligibleForSeries);
+        } else {
+          await markAwaitingFirstMarket(this.sql, [series.ticker]);
         }
       }
     }

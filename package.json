@@ -23,7 +23,9 @@
     "verify-replay": "tsx scripts/verifyReplay.ts",
     "soak": "tsx scripts/soak.ts",
     "soak:verify": "tsx scripts/soakVerify.ts",
-    "restore": "tsx scripts/restore.ts"
+    "restore": "tsx scripts/restore.ts",
+    "integrity": "tsx scripts/integrityCheck.ts",
+    "integrity:full": "tsx scripts/integrityCheck.ts --full"
   },
   "dependencies": {
     "@vercel/blob": "^2.8.0",
