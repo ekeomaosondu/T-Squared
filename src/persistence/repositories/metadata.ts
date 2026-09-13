@@ -261,10 +261,10 @@ export async function listOpenTrackingWindows(
   sql: Sql,
 ): Promise<{ market_ticker: string; selector_id: string; tracking_started_at: Date }[]> {
   return sql`
-    SELECT market_ticker, selector_id, tracking_started_at
-      FROM tracked_markets
-     WHERE tracking_ended_at IS NULL
-     ORDER BY tracking_started_at
+    SELECT t.market_ticker, t.selector_id, t.tracking_started_at
+      FROM tracked_markets t
+     WHERE t.tracking_ended_at IS NULL
+     ORDER BY t.tracking_started_at
   `;
 }
 
@@ -290,10 +290,11 @@ export async function loadEventLadders(
   if (eventTickers.length === 0) return new Map();
 
   const rows = await sql<LadderMarketRow[]>`
-    SELECT event_ticker, market_ticker, floor_strike, cap_strike, strike_type, functional_strike
-      FROM markets
-     WHERE event_ticker = ANY(${eventTickers}::text[])
-     ORDER BY event_ticker, floor_strike NULLS FIRST, market_ticker
+    SELECT m.event_ticker, m.market_ticker, m.floor_strike, m.cap_strike,
+           m.strike_type, m.functional_strike
+      FROM markets m
+     WHERE m.event_ticker = ANY(${eventTickers}::text[])
+     ORDER BY m.event_ticker, m.floor_strike NULLS FIRST, m.market_ticker
   `;
 
   const out = new Map<string, LadderMarketRow[]>();

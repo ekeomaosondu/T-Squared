@@ -163,16 +163,16 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
   // Recorded gaps first, so the caller knows up front whether this window was
   // captured from an uninterrupted stream or stitched after a recovery.
   result.gapsInWindow = await sql`
-    SELECT detected_at,
-           session_id,
-           stream_id,
-           expected_seq::text AS expected_seq,
-           received_seq::text AS received_seq,
-           status
-      FROM sequence_gaps
-     WHERE detected_at BETWEEN to_timestamp(${Number(fromMs) / 1000}) AND to_timestamp(${Number(toMs) / 1000})
-       AND affected_markets @> ${JSON.stringify([marketTicker])}::jsonb
-     ORDER BY sequence_gaps.detected_at
+    SELECT g.detected_at,
+           g.session_id,
+           g.stream_id,
+           g.expected_seq,
+           g.received_seq,
+           g.status
+      FROM sequence_gaps g
+     WHERE g.detected_at BETWEEN to_timestamp(${Number(fromMs) / 1000}) AND to_timestamp(${Number(toMs) / 1000})
+       AND g.affected_markets @> ${JSON.stringify([marketTicker])}::jsonb
+     ORDER BY g.detected_at
   `;
 
   let seed = await findSeedSnapshot(sql, marketTicker, fromMs);
@@ -184,14 +184,15 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
   // otherwise fail for every market except the first.
   if (!seed) {
     const later = await sql<SnapshotRow[]>`
-      SELECT snapshot_id, market_ticker, source, session_id, stream_id, sid, seq,
-             received_at, received_at_ms, yes_bids, no_bids, state_hash
-        FROM orderbook_snapshots
-       WHERE market_ticker = ${marketTicker}
-         AND received_at_ms > ${fromMs.toString()}
-         AND received_at_ms <= ${toMs.toString()}
-         AND source IN ('ws_initial', 'ws_recovery', 'session_handoff', 'local_materialized')
-       ORDER BY received_at_ms
+      SELECT s.snapshot_id, s.market_ticker, s.source, s.session_id, s.stream_id,
+             s.sid, s.seq, s.received_at, s.received_at_ms, s.yes_bids, s.no_bids,
+             s.state_hash
+        FROM orderbook_snapshots s
+       WHERE s.market_ticker = ${marketTicker}
+         AND s.received_at_ms > ${fromMs.toString()}
+         AND s.received_at_ms <= ${toMs.toString()}
+         AND s.source IN ('ws_initial', 'ws_recovery', 'session_handoff', 'local_materialized')
+       ORDER BY s.received_at_ms
        LIMIT 1
     `;
     seed = later[0] ?? null;
@@ -228,40 +229,38 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
 
   // Snapshots inside the window mark new epochs and recovery points.
   const laterSnapshots = await sql<SnapshotRow[]>`
-    SELECT snapshot_id, market_ticker, source, session_id, stream_id, sid, seq,
-           received_at, received_at_ms, yes_bids, no_bids, state_hash
-      FROM orderbook_snapshots
-     WHERE market_ticker = ${marketTicker}
-       AND received_at_ms > ${seed.received_at_ms}
-       AND received_at_ms <= ${toMs.toString()}
-       AND source IN ('ws_initial', 'ws_recovery', 'session_handoff')
-     ORDER BY received_at_ms
+    SELECT s.snapshot_id, s.market_ticker, s.source, s.session_id, s.stream_id,
+           s.sid, s.seq, s.received_at, s.received_at_ms, s.yes_bids, s.no_bids,
+           s.state_hash
+      FROM orderbook_snapshots s
+     WHERE s.market_ticker = ${marketTicker}
+       AND s.received_at_ms > ${seed.received_at_ms}
+       AND s.received_at_ms <= ${toMs.toString()}
+       AND s.source IN ('ws_initial', 'ws_recovery', 'session_handoff')
+     ORDER BY s.received_at_ms
   `;
 
-  // NOTE: the ORDER BY must reference the underlying BIGINT columns, not the
-  // ::text output aliases. `seq::text` takes the default alias `seq`, and
-  // Postgres resolves a bare ORDER BY name to the OUTPUT column first -- which
-  // sorts sequence numbers lexicographically (100, 101, 1111, 13, 130) and
-  // applies deltas in the wrong order. Hence the explicit table qualification.
+  // The ordering key is the exchange-supplied `seq`, read as the underlying
+  // BIGINT. No display casts appear here at all: the driver already returns
+  // int8 and numeric as strings, so casting would only risk an output alias
+  // shadowing the source column. See the SQL ordering rule in persistence/db.ts.
   const deltas = await sql<DeltaRow[]>`
-    SELECT id::text            AS id,
-           session_id,
-           stream_id,
-           seq::text           AS seq,
-           side,
-           price::text         AS price,
-           delta_count::text   AS delta_count,
-           applied,
-           apply_error,
-           received_at_ms::text AS received_at_ms,
-           exchange_ts_ms::text AS exchange_ts_ms
-      FROM orderbook_deltas
-     WHERE market_ticker = ${marketTicker}
-       AND received_at_ms > ${seed.received_at_ms}
-       AND received_at_ms <= ${toMs.toString()}
-     ORDER BY orderbook_deltas.session_id,
-              orderbook_deltas.stream_id,
-              orderbook_deltas.seq
+    SELECT d.id,
+           d.session_id,
+           d.stream_id,
+           d.seq,
+           d.side,
+           d.price,
+           d.delta_count,
+           d.applied,
+           d.apply_error,
+           d.received_at_ms,
+           d.exchange_ts_ms
+      FROM orderbook_deltas d
+     WHERE d.market_ticker = ${marketTicker}
+       AND d.received_at_ms > ${seed.received_at_ms}
+       AND d.received_at_ms <= ${toMs.toString()}
+     ORDER BY d.session_id, d.stream_id, d.seq
   `;
 
   let snapIdx = 0;
@@ -406,14 +405,14 @@ export async function verifyReplay(
   const targets = await sql<
     { received_at_ms: string; state_hash: string; seq: string | null; stream_id: string | null }[]
   >`
-    SELECT received_at_ms::text, state_hash, seq::text, stream_id
-      FROM orderbook_snapshots
-     WHERE market_ticker = ${marketTicker}
-       AND source = 'local_materialized'
-       AND received_at_ms >= ${fromMs.toString()}
-       AND received_at_ms <= ${toMs.toString()}
-       AND seq IS NOT NULL
-     ORDER BY orderbook_snapshots.received_at_ms
+    SELECT s.received_at_ms, s.state_hash, s.seq, s.stream_id
+      FROM orderbook_snapshots s
+     WHERE s.market_ticker = ${marketTicker}
+       AND s.source = 'local_materialized'
+       AND s.received_at_ms >= ${fromMs.toString()}
+       AND s.received_at_ms <= ${toMs.toString()}
+       AND s.seq IS NOT NULL
+     ORDER BY s.received_at_ms
      LIMIT ${limit}
   `;
 

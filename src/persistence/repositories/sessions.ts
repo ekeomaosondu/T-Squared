@@ -101,7 +101,7 @@ export async function getSession(sql: Sql, sessionId: string): Promise<SessionRo
 
 export async function listRecentSessions(sql: Sql, limit = 20): Promise<SessionRow[]> {
   return sql<SessionRow[]>`
-    SELECT * FROM collector_sessions ORDER BY started_at DESC LIMIT ${limit}
+    SELECT s.* FROM collector_sessions s ORDER BY s.started_at DESC LIMIT ${limit}
   `;
 }
 
@@ -111,10 +111,10 @@ export async function listRecentSessions(sql: Sql, limit = 20): Promise<SessionR
  */
 export async function findLiveSessions(sql: Sql, staleMs: number): Promise<SessionRow[]> {
   return sql<SessionRow[]>`
-    SELECT * FROM collector_sessions
-     WHERE ended_at IS NULL
-       AND last_heartbeat_at > now() - make_interval(secs => ${staleMs / 1000})
-     ORDER BY started_at DESC
+    SELECT s.* FROM collector_sessions s
+     WHERE s.ended_at IS NULL
+       AND s.last_heartbeat_at > now() - make_interval(secs => ${staleMs / 1000})
+     ORDER BY s.started_at DESC
   `;
 }
 

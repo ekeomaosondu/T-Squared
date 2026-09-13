@@ -12,7 +12,8 @@ import { logger } from '@/src/logging/logger';
 
 export interface EnsuredPartition {
   partition_name: string;
-  day: string;
+  /** Aliased away from the source column name so it can never shadow it. */
+  day_text: string;
   created: boolean;
 }
 
@@ -22,8 +23,8 @@ export async function ensureRawPartitions(
   daysBehind = 1,
 ): Promise<EnsuredPartition[]> {
   const rows = await sql<EnsuredPartition[]>`
-    SELECT partition_name, day::text AS day, created
-    FROM ensure_raw_ingest_partitions(${daysAhead}::int, ${daysBehind}::int)
+    SELECT p.partition_name, p.day::text AS day_text, p.created
+    FROM ensure_raw_ingest_partitions(${daysAhead}::int, ${daysBehind}::int) p
   `;
 
   const created = rows.filter((r) => r.created);

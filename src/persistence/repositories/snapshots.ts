@@ -102,13 +102,14 @@ export async function findSeedSnapshot(
   atMs: bigint,
 ): Promise<SnapshotRow | null> {
   const rows = await sql<SnapshotRow[]>`
-    SELECT snapshot_id, market_ticker, source, session_id, stream_id, sid, seq,
-           received_at, received_at_ms, yes_bids, no_bids, state_hash
-      FROM orderbook_snapshots
-     WHERE market_ticker = ${marketTicker}
-       AND received_at_ms <= ${atMs.toString()}
-       AND source IN ('ws_initial', 'ws_recovery', 'session_handoff', 'local_materialized')
-     ORDER BY received_at_ms DESC, snapshot_id DESC
+    SELECT s.snapshot_id, s.market_ticker, s.source, s.session_id, s.stream_id,
+           s.sid, s.seq, s.received_at, s.received_at_ms, s.yes_bids, s.no_bids,
+           s.state_hash
+      FROM orderbook_snapshots s
+     WHERE s.market_ticker = ${marketTicker}
+       AND s.received_at_ms <= ${atMs.toString()}
+       AND s.source IN ('ws_initial', 'ws_recovery', 'session_handoff', 'local_materialized')
+     ORDER BY s.received_at_ms DESC, s.snapshot_id DESC
      LIMIT 1
   `;
   return rows[0] ?? null;
@@ -122,24 +123,26 @@ export async function listSnapshots(
   limit = 500,
 ): Promise<SnapshotRow[]> {
   return sql<SnapshotRow[]>`
-    SELECT snapshot_id, market_ticker, source, session_id, stream_id, sid, seq,
-           received_at, received_at_ms, yes_bids, no_bids, state_hash
-      FROM orderbook_snapshots
-     WHERE market_ticker = ${marketTicker}
-       AND received_at_ms >= ${fromMs.toString()}
-       AND received_at_ms <= ${toMs.toString()}
-     ORDER BY received_at_ms
+    SELECT s.snapshot_id, s.market_ticker, s.source, s.session_id, s.stream_id,
+           s.sid, s.seq, s.received_at, s.received_at_ms, s.yes_bids, s.no_bids,
+           s.state_hash
+      FROM orderbook_snapshots s
+     WHERE s.market_ticker = ${marketTicker}
+       AND s.received_at_ms >= ${fromMs.toString()}
+       AND s.received_at_ms <= ${toMs.toString()}
+     ORDER BY s.received_at_ms
      LIMIT ${Math.min(limit, 5000)}
   `;
 }
 
 export async function latestSnapshot(sql: Sql, marketTicker: string): Promise<SnapshotRow | null> {
   const rows = await sql<SnapshotRow[]>`
-    SELECT snapshot_id, market_ticker, source, session_id, stream_id, sid, seq,
-           received_at, received_at_ms, yes_bids, no_bids, state_hash
-      FROM orderbook_snapshots
-     WHERE market_ticker = ${marketTicker}
-     ORDER BY received_at_ms DESC, snapshot_id DESC
+    SELECT s.snapshot_id, s.market_ticker, s.source, s.session_id, s.stream_id,
+           s.sid, s.seq, s.received_at, s.received_at_ms, s.yes_bids, s.no_bids,
+           s.state_hash
+      FROM orderbook_snapshots s
+     WHERE s.market_ticker = ${marketTicker}
+     ORDER BY s.received_at_ms DESC, s.snapshot_id DESC
      LIMIT 1
   `;
   return rows[0] ?? null;

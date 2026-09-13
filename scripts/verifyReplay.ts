@@ -21,8 +21,8 @@ async function main() {
   const sql = db();
 
   const [bounds] = (await sql`
-    SELECT min(received_at_ms)::text AS from_ms, max(received_at_ms)::text AS to_ms
-      FROM orderbook_snapshots
+    SELECT min(s.received_at_ms) AS from_ms, max(s.received_at_ms) AS to_ms
+      FROM orderbook_snapshots s
   `) as unknown as { from_ms: string | null; to_ms: string | null }[];
 
   if (!bounds?.from_ms || !bounds.to_ms) {
@@ -39,7 +39,7 @@ async function main() {
   const tickers = only
     ? [only]
     : ((await sql`
-        SELECT DISTINCT market_ticker FROM orderbook_deltas ORDER BY market_ticker
+        SELECT DISTINCT d.market_ticker FROM orderbook_deltas d ORDER BY d.market_ticker
       `) as unknown as { market_ticker: string }[]).map((r) => r.market_ticker);
 
   console.log(

@@ -91,12 +91,12 @@ export async function listRecentIntegrityEvents(
 ) {
   const limit = Math.min(opts.limit ?? 100, 1000);
   return sql`
-    SELECT id, session_id, market_ticker, detected_at, type, severity, details,
-           resolved_at, resolution
-      FROM integrity_events
-     WHERE (${opts.since ?? null}::timestamptz IS NULL OR detected_at >= ${opts.since ?? null})
-       AND (${opts.type ?? null}::text IS NULL OR type = ${opts.type ?? null})
-     ORDER BY detected_at DESC
+    SELECT e.id, e.session_id, e.market_ticker, e.detected_at, e.type, e.severity,
+           e.details, e.resolved_at, e.resolution
+      FROM integrity_events e
+     WHERE (${opts.since ?? null}::timestamptz IS NULL OR e.detected_at >= ${opts.since ?? null})
+       AND (${opts.type ?? null}::text IS NULL OR e.type = ${opts.type ?? null})
+     ORDER BY e.detected_at DESC
      LIMIT ${limit}
   `;
 }

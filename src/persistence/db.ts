@@ -3,6 +3,33 @@ import { env, redactDatabaseUrl } from '@/src/config/env';
 import { logger } from '@/src/logging/logger';
 
 /**
+ * ===========================================================================
+ * SQL ORDERING RULES  (project-wide, enforced by tests/sqlConventions.test.ts)
+ * ===========================================================================
+ *
+ * PostgreSQL resolves a bare name in ORDER BY / GROUP BY / DISTINCT ON to an
+ * OUTPUT COLUMN ALIAS in preference to an input column. So this:
+ *
+ *     SELECT d.seq::text AS seq FROM orderbook_deltas d ORDER BY seq;
+ *
+ * sorts the TEXT result -- 100, 101, 1111, 13, 130 -- not the number. That
+ * silently applied order-book deltas in the wrong order and was only caught
+ * because replay equality failed.
+ *
+ * Two rules follow:
+ *
+ *   1. Never cast a numeric or temporal ORDERING KEY into its display
+ *      representation inside the query that performs the ordering. It is not
+ *      needed anyway: this driver is configured to return int8 as a string and
+ *      postgres.js returns numeric as a string, so values arrive decimal-safe
+ *      without any cast. If a cast is genuinely required, alias it to a name
+ *      that cannot shadow a column (e.g. `AS day_text`).
+ *
+ *   2. Every ORDER BY / GROUP BY / DISTINCT ON referring to a source column
+ *      must be table-qualified:  ORDER BY d.seq,  not  ORDER BY seq.
+ *
+ * ===========================================================================
+ *
  * Lightweight typed SQL over postgres.js. No ORM in the ingest hot path.
  *
  * Decimal safety: NUMERIC and BIGINT are ALWAYS returned as strings and handed
