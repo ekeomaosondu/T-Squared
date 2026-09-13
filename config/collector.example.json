@@ -1,0 +1,57 @@
+{
+  "$comment": "Copy to config/collector.json. Adding series requires no code change.",
+  "selectors": [
+    {
+      "id": "daily-temperature",
+      "seriesPrefixes": [
+        "KXHIGH",
+        "KXLOW"
+      ],
+      "categories": [
+        "Climate and Weather"
+      ],
+      "statuses": [
+        "initialized",
+        "active",
+        "inactive",
+        "closed",
+        "determined"
+      ],
+      "subscribeBeforeOpenSeconds": 21600,
+      "retainAfterCloseSeconds": 7200,
+      "$comment": "categories is a server-side API filter. Without it, the KXHIGH/KXLOW prefixes also match KXHIGHINFLATION, KXLOWESTRATE and KXHIGHMOVDJT, which are not temperature markets."
+    }
+  ],
+  "capture": {
+    "orderbookDeltas": true,
+    "trades": true,
+    "tickerUpdates": true,
+    "lifecycleEvents": true,
+    "privateOrders": false,
+    "privateFills": false
+  },
+  "sampling": {
+    "bboIntervalsMs": [
+      1000,
+      5000,
+      60000
+    ],
+    "fullBookIntervalsMs": [
+      5000,
+      60000
+    ],
+    "eventLadderIntervalsMs": [
+      1000,
+      5000,
+      60000
+    ]
+  },
+  "validation": {
+    "restOrderbookIntervalMs": 60000,
+    "maxMarketsPerValidationBatch": 50
+  },
+  "retention": {
+    "rawPostgresHours": 48,
+    "normalizedDays": null
+  }
+}

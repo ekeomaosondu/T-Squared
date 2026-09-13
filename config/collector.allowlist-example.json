@@ -1,0 +1,33 @@
+{
+  "$comment": "Illustrates pinning an explicit set of series instead of prefix discovery. No code change required to switch between this and the prefix form.",
+  "selectors": [
+    {
+      "id": "four-city-temperature",
+      "seriesAllowlist": ["KXHIGHNY", "KXLOWNY", "KXHIGHLAX", "KXLOWLAX"],
+      "statuses": ["initialized", "active", "inactive", "closed", "determined"],
+      "subscribeBeforeOpenSeconds": 21600,
+      "retainAfterCloseSeconds": 7200
+    }
+  ],
+  "capture": {
+    "orderbookDeltas": true,
+    "trades": true,
+    "tickerUpdates": true,
+    "lifecycleEvents": true,
+    "privateOrders": false,
+    "privateFills": false
+  },
+  "sampling": {
+    "bboIntervalsMs": [1000, 5000, 60000],
+    "fullBookIntervalsMs": [5000, 60000],
+    "eventLadderIntervalsMs": [1000, 5000, 60000]
+  },
+  "validation": {
+    "restOrderbookIntervalMs": 60000,
+    "maxMarketsPerValidationBatch": 50
+  },
+  "retention": {
+    "rawPostgresHours": 48,
+    "normalizedDays": null
+  }
+}

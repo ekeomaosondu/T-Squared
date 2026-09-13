@@ -1,0 +1,97 @@
+{
+  "$comment": "Verbatim-shaped Kalshi frames. Exercises every level transition required by the recorder spec: new level, increase, partial decrease, complete deletion, YES update, NO update, and a side becoming empty.",
+
+  "scenarios": [
+    {
+      "name": "full-transition-set",
+      "marketTicker": "KXHIGHNY-26SEP14-B74.5",
+      "initialSnapshot": {
+        "type": "orderbook_snapshot",
+        "sid": 7,
+        "seq": 100,
+        "msg": {
+          "market_ticker": "KXHIGHNY-26SEP14-B74.5",
+          "market_id": "9b0f6b43-5b68-4f9f-9f02-9a2d1b8ac1a1",
+          "yes_dollars_fp": [["0.4200", "150.00"], ["0.4100", "300.00"]],
+          "no_dollars_fp": [["0.5700", "100.00"], ["0.5600", "250.00"]]
+        }
+      },
+      "deltas": [
+        { "label": "new level on YES",        "seq": 101, "side": "yes", "price_dollars": "0.4300", "delta_fp": "75.00" },
+        { "label": "increase YES",            "seq": 102, "side": "yes", "price_dollars": "0.4200", "delta_fp": "50.00" },
+        { "label": "partial decrease YES",    "seq": 103, "side": "yes", "price_dollars": "0.4100", "delta_fp": "-100.00" },
+        { "label": "complete deletion NO",    "seq": 104, "side": "no",  "price_dollars": "0.5700", "delta_fp": "-100.00" },
+        { "label": "new level on NO",         "seq": 105, "side": "no",  "price_dollars": "0.5500", "delta_fp": "400.00" },
+        { "label": "increase NO",             "seq": 106, "side": "no",  "price_dollars": "0.5600", "delta_fp": "25.00" },
+        { "label": "fractional decrease YES", "seq": 107, "side": "yes", "price_dollars": "0.4200", "delta_fp": "-0.37" },
+        { "label": "complete deletion YES",   "seq": 108, "side": "yes", "price_dollars": "0.4300", "delta_fp": "-75.00" }
+      ],
+      "expectedFinalSnapshot": {
+        "type": "orderbook_snapshot",
+        "sid": 7,
+        "seq": 108,
+        "msg": {
+          "market_ticker": "KXHIGHNY-26SEP14-B74.5",
+          "market_id": "9b0f6b43-5b68-4f9f-9f02-9a2d1b8ac1a1",
+          "yes_dollars_fp": [["0.4200", "199.63"], ["0.4100", "200.00"]],
+          "no_dollars_fp": [["0.5600", "275.00"], ["0.5500", "400.00"]]
+        }
+      }
+    },
+
+    {
+      "name": "yes-side-emptied",
+      "marketTicker": "KXLOWLAX-26SEP14-T58",
+      "initialSnapshot": {
+        "type": "orderbook_snapshot",
+        "sid": 8,
+        "seq": 500,
+        "msg": {
+          "market_ticker": "KXLOWLAX-26SEP14-T58",
+          "yes_dollars_fp": [["0.0300", "20.00"]],
+          "no_dollars_fp": [["0.9500", "40.00"], ["0.9400", "10.50"]]
+        }
+      },
+      "deltas": [
+        { "label": "empty the YES side entirely", "seq": 501, "side": "yes", "price_dollars": "0.0300", "delta_fp": "-20.00" }
+      ],
+      "expectedFinalSnapshot": {
+        "type": "orderbook_snapshot",
+        "sid": 8,
+        "seq": 501,
+        "msg": {
+          "market_ticker": "KXLOWLAX-26SEP14-T58",
+          "no_dollars_fp": [["0.9500", "40.00"], ["0.9400", "10.50"]]
+        }
+      }
+    },
+
+    {
+      "name": "snapshot-with-absent-side",
+      "$comment": "Kalshi OMITS the key entirely when a side has no resting interest; it is not sent as an empty array.",
+      "marketTicker": "KXHIGHNY-26SEP13-B82.5",
+      "initialSnapshot": {
+        "type": "orderbook_snapshot",
+        "sid": 9,
+        "seq": 1,
+        "msg": {
+          "market_ticker": "KXHIGHNY-26SEP13-B82.5",
+          "no_dollars_fp": [["0.0100", "818.06"], ["0.9900", "12.00"]]
+        }
+      },
+      "deltas": [
+        { "label": "first YES interest appears", "seq": 2, "side": "yes", "price_dollars": "0.0100", "delta_fp": "5.00" }
+      ],
+      "expectedFinalSnapshot": {
+        "type": "orderbook_snapshot",
+        "sid": 9,
+        "seq": 2,
+        "msg": {
+          "market_ticker": "KXHIGHNY-26SEP13-B82.5",
+          "yes_dollars_fp": [["0.0100", "5.00"]],
+          "no_dollars_fp": [["0.0100", "818.06"], ["0.9900", "12.00"]]
+        }
+      }
+    }
+  ]
+}
