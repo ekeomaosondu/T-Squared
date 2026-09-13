@@ -37,6 +37,14 @@ export interface ReplayOptions {
    */
   toSeq?: bigint;
   toSeqStream?: string | null;
+  /**
+   * Called after every state change, with the position just reached.
+   *
+   * Lets a caller check many points in ONE forward pass instead of replaying
+   * from the window start for each one, which is O(n^2) and unusable on a
+   * multi-week dataset.
+   */
+  onPosition?: (position: { streamId: string | null; seq: bigint | null; book: MarketBook }) => void;
   /** Stop at the first integrity problem rather than continuing. */
   strict?: boolean;
 }
@@ -344,6 +352,7 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
   };
 
   emit(BigInt(seed.received_at_ms));
+  opts.onPosition?.({ streamId: currentStream, seq: book.lastSeq, book });
 
   for (const delta of deltas) {
     const atMs = BigInt(delta.received_at_ms);
@@ -407,6 +416,7 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
       if (snap.source === 'ws_recovery') epoch.gaps += 1;
 
       emit(BigInt(snap.received_at_ms));
+      opts.onPosition?.({ streamId: currentStream, seq: book.lastSeq, book });
     }
 
     result.totalDeltas += 1;
@@ -443,6 +453,7 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
     result.appliedDeltas += 1;
     epoch.deltasApplied += 1;
     emit(atMs);
+    opts.onPosition?.({ streamId: delta.stream_id, seq: BigInt(delta.seq), book });
   }
 
   // A snapshot can land after the final delta -- most often a reconnect's
@@ -473,6 +484,7 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
         result.epochs.push(epoch);
       }
       emit(BigInt(snap.received_at_ms));
+      opts.onPosition?.({ streamId: currentStream, seq: book.lastSeq, book });
     }
   }
 
@@ -508,6 +520,13 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
  * raw history up to that instant and the state hashes are compared. This is the
  * end-to-end proof that recorded deltas reproduce recorded state.
  */
+interface VerifyTarget {
+  received_at_ms: string;
+  state_hash: string;
+  seq: string | null;
+  stream_id: string | null;
+}
+
 export interface VerifyResult {
   marketTicker: string;
   checked: number;
@@ -515,6 +534,15 @@ export interface VerifyResult {
   mismatches: { atMs: string; expected: string; actual: string }[];
 }
 
+/**
+ * Verifies replay against snapshots the recorder wrote independently.
+ *
+ * ONE forward pass: every materialised snapshot in the window is indexed by the
+ * (stream, seq) position it was taken at, and each is checked as the replay
+ * reaches that position. The previous implementation replayed from the window
+ * start for every target, which is quadratic and took longer than the capture
+ * itself on 45 minutes of data.
+ */
 export async function verifyReplay(
   sql: Sql,
   marketTicker: string,
@@ -522,9 +550,7 @@ export async function verifyReplay(
   toMs: bigint,
   limit = 25,
 ): Promise<VerifyResult> {
-  const targets = await sql<
-    { received_at_ms: string; state_hash: string; seq: string | null; stream_id: string | null }[]
-  >`
+  const targets = await sql<VerifyTarget[]>`
     SELECT s.received_at_ms, s.state_hash, s.seq, s.stream_id
       FROM orderbook_snapshots s
      WHERE s.market_ticker = ${marketTicker}
@@ -537,31 +563,51 @@ export async function verifyReplay(
   `;
 
   const out: VerifyResult = { marketTicker, checked: 0, matched: 0, mismatches: [] };
+  if (targets.length === 0) return out;
 
-  for (const target of targets) {
-    const atMs = BigInt(target.received_at_ms);
+  // Several samples can share a position when nothing traded between them.
+  const byPosition = new Map<string, VerifyTarget[]>();
+  for (const t of targets) {
+    const key = `${t.stream_id ?? ''}:${t.seq}`;
+    const list: VerifyTarget[] = byPosition.get(key) ?? [];
+    list.push(t);
+    byPosition.set(key, list);
+  }
 
-    // Seed from the START of the window, not from just before the target, so
-    // every delta in between has to do real work. Materialised snapshots are
-    // not used as re-seed points during replay, so they cannot short-circuit
-    // the comparison. The bound is the snapshot's sequence number, which is
-    // exact where a millisecond timestamp is not.
-    // The window ends AT the target instant. Materialised snapshots carry the
-    // true sampling time, so this is exact; toSeq only disambiguates events
-    // sharing the final millisecond.
-    const r = await replay(sql, {
-      marketTicker,
-      fromMs,
-      toMs: atMs,
-      toSeq: target.seq === null ? undefined : BigInt(target.seq),
-      toSeqStream: target.stream_id,
-    });
-    if (!r.finalBook) continue;
+  const seen = new Set<string>();
 
-    out.checked += 1;
-    const actual = r.finalBook.getStateHash();
-    if (actual === target.state_hash) out.matched += 1;
-    else out.mismatches.push({ atMs: target.received_at_ms, expected: target.state_hash, actual });
+  await replay(sql, {
+    marketTicker,
+    fromMs,
+    toMs,
+    onPosition: ({ streamId, seq, book }) => {
+      if (seq === null) return;
+      const key = `${streamId ?? ''}:${seq}`;
+      const hits = byPosition.get(key);
+      if (!hits || seen.has(key)) return;
+      seen.add(key);
+
+      const actual = book.getStateHash();
+      for (const t of hits) {
+        out.checked += 1;
+        if (actual === t.state_hash) out.matched += 1;
+        else out.mismatches.push({ atMs: t.received_at_ms, expected: t.state_hash, actual });
+      }
+    },
+  });
+
+  // A target whose position the replay never reached is itself a failure: the
+  // recorder asserted a state the delta stream cannot account for.
+  for (const [key, hits] of byPosition) {
+    if (seen.has(key)) continue;
+    for (const t of hits) {
+      out.checked += 1;
+      out.mismatches.push({
+        atMs: t.received_at_ms,
+        expected: t.state_hash,
+        actual: '(position never reached during replay)',
+      });
+    }
   }
 
   return out;

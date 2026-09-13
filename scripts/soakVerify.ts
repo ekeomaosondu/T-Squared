@@ -22,6 +22,13 @@ function check(name: string, pass: boolean, detail: string): void {
 }
 
 async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+  // Verification is a single forward pass per market, so checking every
+  // recorded snapshot is cheap; the previous quadratic implementation took
+  // longer than the capture itself.
+  const limitArg = argv.indexOf('--limit');
+  const limit = limitArg === -1 ? 100_000 : Number(argv[limitArg + 1]);
+
   const sql = db();
 
   // ---- all expected raw frames durable ----------------------------------
@@ -192,7 +199,7 @@ async function main(): Promise<void> {
     const failures: string[] = [];
 
     for (const ticker of tickers) {
-      const v = await verifyReplay(sql, ticker, BigInt(bounds[0].from_ms) - 1n, BigInt(bounds[0].to_ms), 200);
+      const v = await verifyReplay(sql, ticker, BigInt(bounds[0].from_ms) - 1n, BigInt(bounds[0].to_ms), limit);
       checked += v.checked;
       matched += v.matched;
       if (v.checked > 0 && v.matched !== v.checked) failures.push(`${ticker}(${v.matched}/${v.checked})`);
