@@ -22,7 +22,8 @@
     "db:psql": "docker compose exec -T postgres psql -U kalshi -d kalshi_recorder",
     "verify-replay": "tsx scripts/verifyReplay.ts",
     "soak": "tsx scripts/soak.ts",
-    "soak:verify": "tsx scripts/soakVerify.ts"
+    "soak:verify": "tsx scripts/soakVerify.ts",
+    "restore": "tsx scripts/restore.ts"
   },
   "dependencies": {
     "@vercel/blob": "^2.8.0",

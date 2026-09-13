@@ -343,6 +343,34 @@ export class Collector extends EventEmitter {
     }
   }
 
+  /**
+   * Subscribes one channel and returns the identifiers needed to bind it.
+   *
+   * Used by the archive restore path, which reproduces each recorded
+   * subscription so restored frames resolve to the same stream they were
+   * captured on. Normal operation goes through subscribeAll.
+   */
+  async subscribeChannel(
+    channel: string,
+    markets: string[],
+  ): Promise<{ streamId: string; commandId: number } | null> {
+    const subs = this.subscriptions.subscribe(channel, markets);
+    const sub = subs[0];
+    if (!sub) return null;
+
+    await createStream(this.sql, {
+      streamId: sub.streamId,
+      sessionId: this.sessionId,
+      channel: sub.channel,
+      sid: null,
+      marketTickers: [...sub.markets],
+    });
+    this.sequences.register(sub.streamId, sub.channel);
+    this.recovery.register(sub.streamId);
+
+    return { streamId: sub.streamId, commandId: sub.pendingCommandId ?? 0 };
+  }
+
   /** Applies a universe diff to live subscriptions without reconnecting. */
   async applyUniverseDiff(added: string[], removed: string[]): Promise<void> {
     if (added.length === 0 && removed.length === 0) return;

@@ -68,9 +68,14 @@ export class FakeWebSocketClient extends EventEmitter {
     return id;
   }
 
-  /** Delivers the server's `subscribed` ack for the most recent subscribe. */
-  ackSubscribe(channel: string, commandId?: number): number {
-    const sid = this.nextSid++;
+  /**
+   * Delivers the server's `subscribed` ack for the most recent subscribe.
+   *
+   * `forceSid` reproduces a sid recorded in an archive, so restored frames
+   * resolve to the same subscription they were captured on.
+   */
+  ackSubscribe(channel: string, commandId?: number, forceSid?: number): number {
+    const sid = forceSid ?? this.nextSid++;
     const id = commandId ?? this.sent.filter((c) => c.cmd === 'subscribe').at(-1)?.id;
     this.deliver({ type: 'subscribed', id, msg: { channel, sid } });
     return sid;
