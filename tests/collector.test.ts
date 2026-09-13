@@ -11,6 +11,7 @@ import {
   tickerFrame,
   tradeFrame,
 } from './fixtures/syntheticFeed';
+import { fakeSql } from './fixtures/fakeSql';
 
 const TICKER = 'KXHIGHNY-26SEP14-B74.5';
 const OTHER = 'KXHIGHNY-26SEP14-B76.5';
@@ -27,15 +28,6 @@ class RecordingWriter {
   get rawSeqs(): (string | null)[] {
     return this.units.map((u) => (u.raw?.seq === null || u.raw?.seq === undefined ? null : u.raw.seq.toString()));
   }
-}
-
-/** Minimal `sql` stub: the collector's DB work is deferred and not under test. */
-function fakeSql() {
-  const fn = (() => Promise.resolve([{ id: '1' }])) as unknown as Record<string, unknown>;
-  return new Proxy(fn, {
-    apply: () => Promise.resolve([{ id: '1' }]),
-    get: (_t, prop) => (prop === 'json' ? (v: unknown) => v : () => Promise.resolve([{ id: '1' }])),
-  }) as never;
 }
 
 function makeCollector(overrides: { capture?: Record<string, boolean>; tracked?: string[] } = {}) {

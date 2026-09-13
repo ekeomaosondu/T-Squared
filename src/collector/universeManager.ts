@@ -70,6 +70,9 @@ export class UniverseManager {
 
   /** event_ticker -> series_ticker, from the API relationship. */
   private readonly seriesByEvent = new Map<string, string>();
+  /** Series visible in discoveryScope, whether or not they are captured. */
+  private inScopeSeries = new Set<string>();
+  private discoveryScopeRefreshedAtMs = 0;
   private readonly pendingMetadataRefresh = new Set<string>();
   private readonly pendingEventRefresh = new Set<string>();
 
@@ -137,8 +140,13 @@ export class UniverseManager {
   async discover(now = new Date()): Promise<UniverseDiff> {
     const desired = new Map<string, TrackedMarket>();
 
+    // Observe-only scope first, so the operator can see what is available to
+    // capture without any of it being subscribed.
+    await this.refreshDiscoveryScope(now);
+
     for (const selector of this.config.selectors) {
       const seriesList = await this.resolveSeries(selector);
+      this.assertCaptureScope(selector.id, seriesList.map((x) => x.ticker));
 
       // Only look back as far as the selector actually retains closed markets.
       const minCloseTs =
@@ -244,6 +252,83 @@ export class UniverseManager {
         );
       }
     }
+  }
+
+  /**
+   * Persists metadata for the broad discovery scope WITHOUT subscribing to any
+   * of it. Only series rows are written: fetching events and markets for every
+   * candidate would cost far more than the visibility is worth, and none of it
+   * is being recorded anyway.
+   */
+  private async refreshDiscoveryScope(now: Date): Promise<void> {
+    const scope = this.config.discoveryScope;
+    if (!scope?.persistMetadata) return;
+
+    // Series metadata is near-static; refresh on the metadata cadence.
+    if (this.clock() - this.discoveryScopeRefreshedAtMs < this.seriesCacheTtlMs) return;
+    this.discoveryScopeRefreshedAtMs = this.clock();
+
+    const deny = new Set(scope.seriesDenylist ?? []);
+    const categories = scope.categories?.length ? scope.categories : [undefined];
+    const seen = new Map<string, KalshiSeries>();
+
+    for (const category of categories) {
+      for (const series of await this.listSeries(category)) {
+        if (deny.has(series.ticker)) continue;
+        if (scope.seriesPrefixes?.length && !scope.seriesPrefixes.some((p) => series.ticker.startsWith(p))) {
+          continue;
+        }
+        seen.set(series.ticker, series);
+      }
+    }
+
+    for (const series of seen.values()) await upsertSeries(this.sql, series, now);
+
+    this.inScopeSeries = new Set(seen.keys());
+
+    logger.info(
+      { event: 'discovery_scope_refreshed', inScope: seen.size },
+      `discovery scope: ${seen.size} series visible`,
+    );
+  }
+
+  /**
+   * Series visible in discovery scope that are NOT being captured.
+   *
+   * Computed on read rather than cached, because the capture set is only known
+   * after the diff has been applied.
+   */
+  get observedOnlySeries(): string[] {
+    const captured = new Set(this.capturedSeriesTickers());
+    return [...this.inScopeSeries].filter((t) => !captured.has(t)).sort();
+  }
+
+  /** Series visible in discovery scope, captured or not. */
+  get inScopeSeriesCount(): number {
+    return this.inScopeSeries.size;
+  }
+
+  private capturedSeriesTickers(): string[] {
+    return [...new Set(this.trackedMarkets.map((m) => m.seriesTicker).filter((s): s is string => !!s))];
+  }
+
+  /**
+   * Refuses to capture an unexpectedly wide universe.
+   *
+   * A prefix selector can silently widen when the exchange lists new series, so
+   * this turns "the recorder quietly started capturing 104 series" into a
+   * startup failure that has to be acknowledged in config.
+   */
+  private assertCaptureScope(selectorId: string, seriesTickers: string[]): void {
+    const limit = this.config.maxCaptureSeries;
+    if (seriesTickers.length <= limit) return;
+
+    throw new Error(
+      `Selector "${selectorId}" resolves to ${seriesTickers.length} series, which exceeds ` +
+        `maxCaptureSeries (${limit}). Capturing this many series is a deliberate decision: ` +
+        `either narrow the selector (seriesAllowlist is the usual answer) or raise ` +
+        `maxCaptureSeries in the collector config. First few: ${seriesTickers.slice(0, 8).join(', ')}`,
+    );
   }
 
   /**

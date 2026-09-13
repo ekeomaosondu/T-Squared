@@ -3,6 +3,7 @@ import { UniverseManager } from '@/src/collector/universeManager';
 import { parseCollectorConfig, type MarketSelector } from '@/src/config/collectorConfig';
 import { statusFiltersForSelector } from '@/src/kalshi/schemas';
 import type { KalshiMarket } from '@/src/kalshi/schemas';
+import { fakeSql } from './fixtures/fakeSql';
 
 const NOW = new Date('2026-09-13T18:00:00Z');
 
@@ -19,7 +20,7 @@ function market(overrides: Partial<KalshiMarket> = {}): KalshiMarket {
 
 function manager(): UniverseManager {
   return new UniverseManager({
-    sql: (() => Promise.resolve([])) as never,
+    sql: fakeSql([]),
     rest: {} as never,
     config: parseCollectorConfig({ selectors: [{ id: 't', seriesAllowlist: ['KXHIGHNY'] }] }),
   });
@@ -115,5 +116,64 @@ describe('collector config', () => {
     // Private channels stay off unless explicitly enabled.
     expect(cfg.capture.privateOrders).toBe(false);
     expect(cfg.capture.privateFills).toBe(false);
+  });
+});
+
+describe('discovery scope vs capture scope', () => {
+  it('defaults to an explicit capture allowlist, not a prefix', async () => {
+    const { DEFAULT_COLLECTOR_CONFIG } = await import('@/src/config/collectorConfig');
+    const selector = DEFAULT_COLLECTOR_CONFIG.selectors[0]!;
+
+    // The KXHIGH/KXLOW prefixes match 104 Climate and Weather series on the
+    // live exchange. Capturing that many should be a deliberate act.
+    expect(selector.seriesAllowlist).toEqual(['KXHIGHNY', 'KXLOWNY', 'KXHIGHLAX', 'KXLOWLAX']);
+    expect(selector.seriesPrefixes).toBeUndefined();
+
+    // Broad visibility is retained separately, for metadata only.
+    expect(DEFAULT_COLLECTOR_CONFIG.discoveryScope?.seriesPrefixes).toEqual(['KXHIGH', 'KXLOW']);
+    expect(DEFAULT_COLLECTOR_CONFIG.discoveryScope?.categories).toEqual(['Climate and Weather']);
+  });
+
+  it('caps the capture universe by default', () => {
+    const cfg = parseCollectorConfig({ selectors: [{ id: 'x', seriesAllowlist: ['KXHIGHNY'] }] });
+    expect(cfg.maxCaptureSeries).toBe(25);
+  });
+
+  it('rejects a capture universe wider than maxCaptureSeries', async () => {
+    const series = Array.from({ length: 40 }, (_, i) => ({ ticker: `KXHIGH${i}` }));
+    const rest = {
+      getSeriesList: async () => series,
+      getMarkets: async () => [],
+      getEvent: async () => ({ event: {}, markets: [] }),
+    };
+    const um = new UniverseManager({
+      sql: fakeSql([]),
+      rest: rest as never,
+      config: parseCollectorConfig({
+        maxCaptureSeries: 25,
+        selectors: [{ id: 'too-wide', seriesPrefixes: ['KXHIGH'] }],
+      }),
+    });
+
+    await expect(um.discover()).rejects.toThrow(/resolves to 40 series.*exceeds maxCaptureSeries \(25\)/s);
+  });
+
+  it('allows a wide universe when the limit is raised deliberately', async () => {
+    const series = Array.from({ length: 40 }, (_, i) => ({ ticker: `KXHIGH${i}` }));
+    const rest = {
+      getSeriesList: async () => series,
+      getMarkets: async () => [],
+      getEvent: async () => ({ event: {}, markets: [] }),
+    };
+    const um = new UniverseManager({
+      sql: fakeSql([]),
+      rest: rest as never,
+      config: parseCollectorConfig({
+        maxCaptureSeries: 150,
+        selectors: [{ id: 'wide', seriesPrefixes: ['KXHIGH'] }],
+      }),
+    });
+
+    await expect(um.discover()).resolves.toBeTruthy();
   });
 });

@@ -66,8 +66,45 @@ export type MarketSelector = z.infer<typeof MarketSelectorSchema>;
 
 const intervalList = z.array(z.number().int().positive()).default([]);
 
+/**
+ * Broad scope the recorder OBSERVES but does not capture.
+ *
+ * Discovery and capture are deliberately separate concepts. The KXHIGH and
+ * KXLOW prefixes are not synonymous with "daily high/low temperature" -- on the
+ * live exchange they match 112 series including KXHIGHINFLATION and
+ * KXLOWESTRATE, and even filtered to Climate and Weather they still match 104.
+ *
+ * Recording 104 series for three weeks yields a much larger database, more
+ * subscription complexity, more opportunities for gaps, and a great many
+ * contracts nobody analyses. Four to twenty series, complete and
+ * well-monitored, is the better dataset.
+ *
+ * So this block exists only to keep visibility into what is available: series
+ * metadata is persisted so the operator can see candidates and expand
+ * captureScope deliberately. Nothing here is ever subscribed to.
+ */
+export const DiscoveryScopeSchema = z.object({
+  seriesPrefixes: z.array(z.string().min(1)).optional(),
+  categories: z.array(z.string().min(1)).optional(),
+  seriesDenylist: z.array(z.string().min(1)).optional(),
+  /** Persist series metadata for everything in scope. Cheap: one cached call. */
+  persistMetadata: z.boolean().default(true),
+});
+export type DiscoveryScope = z.infer<typeof DiscoveryScopeSchema>;
+
 export const CollectorConfigSchema = z.object({
+  /** Observed for metadata only; never subscribed. */
+  discoveryScope: DiscoveryScopeSchema.optional(),
+
+  /** The capture universe. Markets here are subscribed and recorded. */
   selectors: z.array(MarketSelectorSchema).min(1),
+
+  /**
+   * Refuse to start if the capture universe resolves to more series than this.
+   * A guard against a config edit silently turning a focused recorder into an
+   * exchange-wide one. Raise it deliberately.
+   */
+  maxCaptureSeries: z.number().int().positive().default(25),
 
   capture: z
     .object({
@@ -115,11 +152,18 @@ export const CollectorConfigSchema = z.object({
 export type CollectorConfig = z.infer<typeof CollectorConfigSchema>;
 
 export const DEFAULT_COLLECTOR_CONFIG: CollectorConfig = CollectorConfigSchema.parse({
+  // Broad visibility, narrow capture.
+  discoveryScope: {
+    seriesPrefixes: ['KXHIGH', 'KXLOW'],
+    categories: ['Climate and Weather'],
+    persistMetadata: true,
+  },
   selectors: [
     {
       id: 'daily-temperature',
-      seriesPrefixes: ['KXHIGH', 'KXLOW'],
-      categories: ['Climate and Weather'],
+      // Explicit by default. Expanding the universe is a config change, not a
+      // side effect of a prefix matching more than intended.
+      seriesAllowlist: ['KXHIGHNY', 'KXLOWNY', 'KXHIGHLAX', 'KXLOWLAX'],
       statuses: ['initialized', 'active', 'inactive', 'closed', 'determined'],
       subscribeBeforeOpenSeconds: 21_600,
       retainAfterCloseSeconds: 7_200,

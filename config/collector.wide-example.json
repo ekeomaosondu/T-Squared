@@ -1,5 +1,5 @@
 {
-  "$comment": "Copy to config/collector.json. Discovery scope and capture scope are separate: the recorder OBSERVES broadly but RECORDS only what is listed in selectors.",
+  "$comment": "Illustrates capturing the FULL weather prefix scope. This is ~104 series: a much larger database, more subscriptions and more opportunity for gaps. maxCaptureSeries must be raised deliberately to allow it.",
   "discoveryScope": {
     "$comment": "Observed for metadata only, never subscribed. Keeps visibility into what could be captured. On the live exchange these prefixes match 104 Climate and Weather series; without the category filter they also match KXHIGHINFLATION, KXLOWESTRATE and KXHIGHMOVDJT.",
     "seriesPrefixes": [
@@ -11,16 +11,16 @@
     ],
     "persistMetadata": true
   },
-  "maxCaptureSeries": 25,
+  "maxCaptureSeries": 150,
   "selectors": [
     {
-      "$comment": "The capture universe. Explicit by default -- expanding it should be a deliberate config change, not a side effect of a prefix matching more than intended.",
-      "id": "daily-temperature",
-      "seriesAllowlist": [
-        "KXHIGHNY",
-        "KXLOWNY",
-        "KXHIGHLAX",
-        "KXLOWLAX"
+      "id": "all-weather-temperature",
+      "seriesPrefixes": [
+        "KXHIGH",
+        "KXLOW"
+      ],
+      "categories": [
+        "Climate and Weather"
       ],
       "statuses": [
         "initialized",

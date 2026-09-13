@@ -3,8 +3,17 @@
   "selectors": [
     {
       "id": "smoke-ny-temperature",
-      "seriesAllowlist": ["KXHIGHNY", "KXLOWNY"],
-      "statuses": ["initialized", "active", "inactive", "closed", "determined"],
+      "seriesAllowlist": [
+        "KXHIGHNY",
+        "KXLOWNY"
+      ],
+      "statuses": [
+        "initialized",
+        "active",
+        "inactive",
+        "closed",
+        "determined"
+      ],
       "subscribeBeforeOpenSeconds": 21600,
       "retainAfterCloseSeconds": 7200
     }
@@ -18,10 +27,25 @@
     "privateFills": false
   },
   "sampling": {
-    "bboIntervalsMs": [1000, 5000],
-    "fullBookIntervalsMs": [5000],
-    "eventLadderIntervalsMs": [1000, 5000]
+    "bboIntervalsMs": [
+      1000,
+      5000
+    ],
+    "fullBookIntervalsMs": [
+      5000
+    ],
+    "eventLadderIntervalsMs": [
+      1000,
+      5000
+    ]
   },
-  "validation": { "restOrderbookIntervalMs": 20000, "maxMarketsPerValidationBatch": 100 },
-  "retention": { "rawPostgresHours": 48, "normalizedDays": null }
+  "validation": {
+    "restOrderbookIntervalMs": 20000,
+    "maxMarketsPerValidationBatch": 100
+  },
+  "retention": {
+    "rawPostgresHours": 48,
+    "normalizedDays": null
+  },
+  "maxCaptureSeries": 25
 }
