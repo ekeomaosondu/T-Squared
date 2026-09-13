@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 import '@/src/config/bootstrap';
-import { closeDb, db, type Sql } from '@/src/persistence/db';
+import { closeDb, db } from '@/src/persistence/db';
 import { verifyReplay } from '@/src/replay/replay';
 
 /**

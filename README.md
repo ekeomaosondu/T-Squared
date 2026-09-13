@@ -18,11 +18,20 @@ recomputed from raw history.
 Implemented and verified against live production data: market discovery,
 WebSocket ingestion, order-book reconstruction, sequence-gap detection and
 recovery, normalized persistence, periodic sampling, synchronized event-ladder
-sampling, REST validation, integrity and health tables, and offline replay.
+sampling, REST validation, integrity and health tables, offline replay, and
+immutable raw archival with verified retention.
 
-Not yet built: Vercel rolling sessions / lease handoff, raw archival to object
-storage, the export CLI, the monitoring dashboard, and the optional private
-order/fill and weather feeds. See [Roadmap](#roadmap).
+Hardened under fault injection: three abrupt socket terminations, two genuinely
+dropped frames, a database stall, and a collector restart mid-event, after
+which **888/888 recorded snapshots still reproduced exactly from raw deltas**.
+
+Not yet built: Vercel rolling sessions / lease handoff, the export CLI, the
+monitoring dashboard, and the optional private order/fill and weather feeds.
+See [Roadmap](#roadmap).
+
+> **Retention is disabled by default.** `RAW_DB_RETENTION_ENABLED=false` until
+> you have confirmed archives are being written and verified. Nothing is ever
+> dropped before its archive is checksum- and row-count-verified.
 
 ---
 
@@ -168,12 +177,32 @@ On `actual_seq != previous_seq + 1`:
 
 Nothing is interpolated and missing updates are never guessed at.
 
-**One episode per discontinuity.** While a gap is open, the baseline is stale by
+This is an explicit state machine (`src/integrity/recoveryStateMachine.ts`):
+
+```
+HEALTHY --sequence discontinuity--> DEGRADED --one recovery request--> RECOVERING
+       <--a valid replacement snapshot for every affected market--
+```
+
+While `DEGRADED` or `RECOVERING`:
+
+| | |
+|---|---|
+| raw frames captured | yes |
+| raw frames persisted | yes |
+| canonical delta apply | **no** |
+| new recovery requests | **no** |
+| derived feature samples | **no** |
+
+**One episode per discontinuity.** While a gap is open the baseline is stale by
 definition, so the tracker reports `degraded` rather than re-reporting. This is
 not cosmetic: without it, a single discontinuity produced thousands of gap rows
 and — because each one requested recovery snapshots, which themselves advance
 the subscription's `seq` — fed back into a snapshot storm (2,552 snapshots
 against 1 delta in seven seconds, observed against live data).
+
+A timed-out episode leaves the stream `DEGRADED`, not healthy: we still cannot
+vouch for those books.
 
 ---
 
@@ -218,6 +247,49 @@ health metric:
 | 1 | critical |
 | 0 | at risk |
 | −1 | today's partition missing — writes are failing |
+
+### Ordering authority
+
+```
+exchange seq   >   ingest_ordinal   >   id
+```
+
+- **`seq`** is the exchange's own sequence, scoped to a subscription. It is the
+  ordering key for order-book replay, always as
+  `(session, stream chronology, seq)`.
+- **`ingest_ordinal`** is an in-process counter assigned synchronously at socket
+  receipt, before any asynchronous work. It records the order this process
+  *observed* frames, is monotonic within a session, and is meaningless across
+  sessions. For the unsequenced `ticker` channel it is the only principled
+  ordering available. Because every frame is captured, including control
+  frames, its contiguity also answers "did a frame go missing between receipt
+  and durability?".
+- **`id`** is provenance identity, assigned at flush time. It is **not** event
+  ordering and must never be used as such.
+
+`seq` restarts on every reconnect, so a session that reconnected holds several
+streams with overlapping `seq` ranges. Ordering by `stream_id` — a random UUID —
+interleaves them arbitrarily. That is invisible with a single stream and
+catastrophic after a reconnect, which is why streams are ordered by when they
+began.
+
+### SQL ordering rules
+
+PostgreSQL resolves a bare name in `ORDER BY` / `GROUP BY` / `DISTINCT ON` to an
+**output column alias** in preference to an input column. So:
+
+```sql
+SELECT d.seq::text AS seq FROM orderbook_deltas d ORDER BY seq;  -- sorts TEXT
+```
+
+yields `100, 101, 1111, 13, 130`. Two rules apply project-wide, enforced by
+`tests/sqlConventions.test.ts`, which scans the source:
+
+1. Never cast a numeric or temporal **ordering key** to its display form inside
+   the query that orders by it. No cast is needed anyway — the driver returns
+   `int8` and `numeric` as strings already.
+2. Every `ORDER BY` / `GROUP BY` / `DISTINCT ON` referring to a source column is
+   table-qualified: `ORDER BY d.seq`, never `ORDER BY seq`.
 
 ### Provenance, not foreign keys
 
@@ -289,12 +361,28 @@ Missing BBOs stay null; they are never imputed.
 Strike grids change daily (observed: 78–85 one day, 74–81 the next), the bucket
 count is never assumed, and no city list is hardcoded.
 
-> **Sizing note.** The default selector (`seriesPrefixes: ["KXHIGH", "KXLOW"]`
-> + `categories: ["Climate and Weather"]`) matches **104 series** on the live
-> exchange. Without the category filter the prefixes also match
-> `KXHIGHINFLATION`, `KXLOWESTRATE` and `KXHIGHMOVDJT`, which are not
-> temperature markets. To start narrower, use `seriesAllowlist` — see
-> `config/collector.allowlist-example.json`.
+### Discovery scope vs capture scope
+
+`KXHIGH`/`KXLOW` is **not** synonymous with daily temperature. Those prefixes
+match 112 series on the live exchange, including `KXHIGHINFLATION`,
+`KXLOWESTRATE` and `KXHIGHMOVDJT`; filtered to Climate and Weather they still
+match **104**.
+
+Three weeks of 104 series means a much larger database, more subscription
+complexity, more opportunity for gaps, and a great many contracts nobody
+analyses. Four to twenty series, complete and well-monitored, is the better
+dataset. So the two concepts are separate:
+
+| | |
+|---|---|
+| **`discoveryScope`** | Observed but **never subscribed**. Series metadata is persisted so you can see what is available and expand deliberately. |
+| **`selectors`** | The capture universe. Explicit allowlist by default. |
+
+`maxCaptureSeries` (default 25) refuses to start when a selector resolves wider
+than expected — a prefix selector can silently widen when the exchange lists new
+series, and that should be a startup failure naming the count and the fix, not a
+recorder that quietly begins capturing a whole category.
+`config/collector.wide-example.json` shows the opt-in for the full scope.
 
 ---
 
@@ -410,12 +498,47 @@ independently. Against 150 seconds of live KXHIGHNY production data:
 
 - `ingest_health_minutes` — per-minute message counts, DB flush latency,
   exchange-to-receive latency percentiles, reconnects, partition runway.
-- `book_validations` — every REST cross-check. A mismatch requests a **WebSocket**
-  recovery snapshot; the live book is never replaced from REST, and only
-  persistent mismatches escalate to a reconnect. Observed match rate on live
-  data: **98.3%** (the residual is timing skew between two independent reads).
+- `book_validations` — every REST cross-check, classified by *timing* rather
+  than bare equality (see below).
 - `integrity_events` — sequence gaps, negative quantities, crossed books,
   ticker/book disagreement, schema drift, DB failures, buffer overflow.
+
+### REST validation semantics
+
+A REST snapshot is built at an unobservable instant between our request and our
+receipt of the response:
+
+```
+t0            request sent
+t0 + 10ms     local delta applied
+t0 + 20ms     REST server builds its snapshot   <-- the state we receive
+t0 + 30ms     local delta applied
+t1 = t0+60ms  response arrives
+```
+
+Comparing that against the book *now* reports a mismatch on any actively traded
+market. A non-matching hash is therefore checked against every state the book
+actually passed through in `[t0 - tolerance, t1 + tolerance]`, reconstructed by
+rewinding a bounded journal of applied deltas. Four outcomes:
+
+| `match_kind` | Meaning | Action |
+|---|---|---|
+| `match_current` | agrees with the book as it stands | none |
+| `match_recent` | agrees with a state the book genuinely held | none |
+| `mismatch_transient` | no match, first observation | re-check in 1.5s |
+| `mismatch_confirmed` | no match on an independent re-check | request WS recovery snapshot |
+
+Only `mismatch_confirmed` is actionable, and only repeated confirmations
+reconnect. The live book is never replaced from REST. Without this, an earlier
+"98.3% match rate" looked like 1.7% corrupt books when it was almost entirely
+timing — and acting on it would have let the validator destabilise a healthy
+recorder.
+
+Recent states are reconstructed by rewinding, not by hashing the book on every
+mutation, which would serialise and SHA-256 the whole ladder thousands of times
+a second. The journal costs one small object per delta and is cleared by a
+snapshot, since a snapshot is a hard reset that earlier deltas no longer
+describe.
 
 Exchange-to-receive latency is computed only from messages carrying a usable
 exchange timestamp and is **not** treated as true network latency — Kalshi's
@@ -439,6 +562,83 @@ Structured JSON only, with `session_id`, `stream_id`, `market_ticker`,
 | `error` | DB failures, gap-recovery failures |
 
 Individual deltas are never logged at `info`.
+
+---
+
+## Raw archiving and retention
+
+```bash
+npm run archive             # seal, archive and verify completed partitions
+npm run archive -- --status # report only
+```
+
+The lifecycle is one-way and every step is recorded, because the last step
+destroys data:
+
+```
+partition completes
+  -> SEAL      row count fixed; no further inserts can land in this range
+  -> ARCHIVE   deterministic NDJSON, gzipped, one part per channel and hour
+  -> VERIFY    every object re-read; SHA-256 and row count must match
+  -> retention floor elapses
+  -> DETACH    concurrently, so ingestion is not blocked
+  -> DROP
+```
+
+Nothing is detached or dropped unless **every part verified** and the archived
+row count equals the count sealed when the partition closed. Verification
+re-reads from storage rather than trusting the upload call, because "the bytes
+are retrievable and correct" is exactly the property the subsequent `DROP`
+depends on.
+
+Archive boundaries follow partition boundaries, so the partition dropped and the
+objects written are provably the same rows:
+
+```
+kalshi/raw/channel=orderbook_delta/date=2026-09-13/hour=17/
+    part-<session>-<first_id>-<last_id>.jsonl.gz
+```
+
+Storage is an interface. Vercel Blob is the default; a local backend exists for
+development. Selecting the local backend in `vercel_rolling` mode is a hard
+error — a function filesystem is not durable, so a local archive would vanish
+and retention could then drop partitions that were never really archived.
+
+`RAW_DB_RETENTION_HOURS` is a **floor** on the age of a completed partition, not
+an exact TTL: with daily partitions the effective retention is between that and
+24 hours more.
+
+---
+
+## Soak testing
+
+A clean run proves normal operation. This deliberately makes operation abnormal:
+
+```bash
+npm run soak -- --minutes 45     # inject faults against live data
+npm run soak:verify              # check the recorded dataset
+```
+
+Injected faults: abrupt socket terminations, genuinely dropped frames (filtered
+at the transport, so gap detection is exercised for real rather than synthesised
+downstream), a database stall long enough to trigger write backpressure, and a
+collector restart mid-event producing a second capture epoch.
+
+`soak:verify` asserts:
+
+- every observed frame is durable (`ingest_ordinal` contiguous, no holes)
+- every sequence gap is recorded *and* recovered
+- no delta was applied to a book lacking a fresh snapshot
+- no duplicate subscriptions
+- `post = pre + delta` for every applied delta, zero negatives
+- no materialised snapshot written for an invalid book
+- every session closed with an explicit reason
+- **replay equality**: every recorded snapshot reproduced exactly from raw deltas
+
+This is the gate for trusting the recorder unattended. Replay equality in
+particular should be treated as a mandatory invariant for any change touching
+ingestion, persistence, sequence handling or SQL ordering — every serious bug
+found so far was caught by it and by nothing else.
 
 ---
 
@@ -466,12 +666,32 @@ fabricated and each session is a separately auditable epoch.
 | P0 | Auth, discovery, WS, raw recorder, parsers, book, trades | done |
 | P1 | Sequence validation, recovery, normalized tables, ticker, lifecycle, dynamic subscriptions | done |
 | P2 | Periodic book sampling, ladder sampling, REST validation, health metrics | done |
-| P3 | Vercel rolling workers, session leases, handoff | not started |
-| P4 | Raw archival to Blob, export CLI | not started |
+| P4 | Raw archival with verified retention | done |
+| P4 | Export CLI | not started |
+| P3 | Vercel rolling workers, session leases, handoff | deferred, see below |
 | P5 | Private order/fill streams, weather reference feeds | scaffolded (schema + interface only) |
 
 Replay (nominally P4) was built early because it is the acceptance test for
 everything below it.
+
+**P4 was deliberately done before P3.** Daemon mode already works, so the safest
+deployment for a multi-week collection is a persistent process rather than
+voluntarily introducing a connection transition roughly twice an hour. Every
+handoff is another opportunity for subscription overlap, snapshot races, gaps,
+duplicate raw frames and lease-ownership mistakes. Archival, by contrast, is
+what makes retention safe at all — and until it existed, nothing could be
+allowed to delete anything.
+
+Recommended topology for the collection period:
+
+```
+Vercel            dashboard / control API
+Persistent worker Kalshi collector (daemon mode)
+Neon              database
+Blob / S3         archives
+```
+
+P3 remains worth building if Vercel-only operation is a hard requirement.
 
 ---
 
