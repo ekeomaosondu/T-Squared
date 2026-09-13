@@ -197,6 +197,31 @@ export class S3ArchiveStore implements ArchiveStore {
       return false;
     }
   }
+
+  /**
+   * Deletes an object.
+   *
+   * Only used by the connectivity smoke test. Archives themselves are
+   * immutable -- nothing in the retention path ever deletes from the lake.
+   */
+  async delete(objectPath: string): Promise<void> {
+    const { DeleteObjectCommand } = await import('@aws-sdk/client-s3');
+    const client = await this.getClient();
+    await client.send(new DeleteObjectCommand({ Bucket: this.opts.bucket, Key: objectPath }));
+  }
+
+  /** Creates the bucket if it does not already exist. */
+  async ensureBucket(): Promise<'exists' | 'created'> {
+    const { HeadBucketCommand, CreateBucketCommand } = await import('@aws-sdk/client-s3');
+    const client = await this.getClient();
+    try {
+      await client.send(new HeadBucketCommand({ Bucket: this.opts.bucket }));
+      return 'exists';
+    } catch {
+      await client.send(new CreateBucketCommand({ Bucket: this.opts.bucket }));
+      return 'created';
+    }
+  }
 }
 
 export interface StoreSelection {

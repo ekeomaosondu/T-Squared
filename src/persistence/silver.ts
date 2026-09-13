@@ -22,6 +22,62 @@ import { logger } from '@/src/logging/logger';
  * Nothing expires until its export row count matches the database exactly.
  */
 
+/**
+ * Explicit Parquet column types.
+ *
+ * postgres.js returns BIGINT and NUMERIC as strings to preserve exactness, so
+ * a naive JSON round-trip lands them in Parquet as VARCHAR. That is not merely
+ * untidy: ORDER BY or min/max on a VARCHAR ordinal sorts lexicographically --
+ * 100 before 99 -- which is precisely the class of bug that made replay apply
+ * deltas out of order. Types are therefore declared, not inferred.
+ *
+ * Prices and sizes become DECIMAL rather than DOUBLE so exchange values stay
+ * exact all the way into research.
+ */
+export const SILVER_COLUMN_TYPES: Record<string, string> = {
+  ingest_ordinal: 'BIGINT',
+  seq: 'BIGINT',
+  sid: 'INTEGER',
+  exchange_ts_ms: 'BIGINT',
+  received_at_ms: 'BIGINT',
+  snapshot_id: 'BIGINT',
+  yes_level_count: 'INTEGER',
+  no_level_count: 'INTEGER',
+
+  price: 'DECIMAL(12,6)',
+  delta_count: 'DECIMAL(24,6)',
+  pre_count: 'DECIMAL(24,6)',
+  post_count: 'DECIMAL(24,6)',
+  yes_price: 'DECIMAL(12,6)',
+  no_price: 'DECIMAL(12,6)',
+  count: 'DECIMAL(24,6)',
+  yes_bid: 'DECIMAL(12,6)',
+  yes_ask: 'DECIMAL(12,6)',
+  yes_bid_size: 'DECIMAL(24,6)',
+  yes_ask_size: 'DECIMAL(24,6)',
+  last_trade_size: 'DECIMAL(24,6)',
+  volume: 'DECIMAL(24,6)',
+  open_interest: 'DECIMAL(24,6)',
+  dollar_volume: 'DECIMAL(24,6)',
+  dollar_open_interest: 'DECIMAL(24,6)',
+  best_yes_bid: 'DECIMAL(12,6)',
+  best_yes_bid_size: 'DECIMAL(24,6)',
+  best_yes_ask: 'DECIMAL(12,6)',
+  best_yes_ask_size: 'DECIMAL(24,6)',
+  spread: 'DECIMAL(12,6)',
+  mid: 'DECIMAL(12,6)',
+};
+
+/** Builds the typed projection for the Parquet COPY. */
+export function typedProjection(columns: string[]): string {
+  return columns
+    .map((c) => {
+      const type = SILVER_COLUMN_TYPES[c];
+      return type ? `CAST("${c}" AS ${type}) AS "${c}"` : `"${c}"`;
+    })
+    .join(', ');
+}
+
 export interface SilverTableSpec {
   /** Postgres table being exported. */
   table: string;
@@ -285,8 +341,13 @@ export class SilverExporter {
     const instance = await DuckDBInstance.create(':memory:');
     const conn = await instance.connect();
     const esc = (p: string) => p.replace(/'/g, "''");
+
+    // Declare types rather than letting them be inferred from JSON strings.
+    const columns = rows.length > 0 ? Object.keys(rows[0]!) : [];
+    const projection = columns.length > 0 ? typedProjection(columns) : '*';
+
     await conn.run(
-      `COPY (SELECT * FROM read_json_auto('${esc(ndjson)}')) ` +
+      `COPY (SELECT ${projection} FROM read_json_auto('${esc(ndjson)}')) ` +
         `TO '${esc(parquet)}' (FORMAT PARQUET, COMPRESSION ZSTD)`,
     );
 

@@ -27,7 +27,8 @@
     "integrity": "tsx scripts/integrityCheck.ts",
     "integrity:full": "tsx scripts/integrityCheck.ts --full",
     "materialize": "tsx scripts/materialize.ts",
-    "silver": "tsx scripts/silver.ts"
+    "silver": "tsx scripts/silver.ts",
+    "archive:smoke": "tsx scripts/archiveSmoke.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1131.0",

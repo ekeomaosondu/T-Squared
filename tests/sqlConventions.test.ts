@@ -165,3 +165,42 @@ describe('ladder sample group identity', () => {
     expect(ladderGroupId('KXHIGHNY-26SEP14', 1000, 1_789_325_001_000)).not.toBe(base);
   });
 });
+
+describe('silver Parquet column typing', () => {
+  it('declares numeric types rather than letting JSON infer VARCHAR', async () => {
+    const { typedProjection, SILVER_COLUMN_TYPES } = await import('@/src/persistence/silver');
+
+    // postgres.js returns BIGINT and NUMERIC as strings to preserve exactness,
+    // so a naive JSON round-trip lands them in Parquet as VARCHAR -- and
+    // min/max on a VARCHAR ordinal sorts lexicographically, putting 100 before
+    // 99. Same hazard as the replay ordering bug, in the research files.
+    const projection = typedProjection(['ingest_ordinal', 'seq', 'price', 'market_ticker']);
+
+    expect(projection).toContain('CAST("ingest_ordinal" AS BIGINT)');
+    expect(projection).toContain('CAST("seq" AS BIGINT)');
+    expect(projection).toContain('CAST("price" AS DECIMAL(12,6))');
+    // Genuinely textual columns pass through untouched.
+    expect(projection).toContain('"market_ticker"');
+    expect(projection).not.toContain('CAST("market_ticker"');
+
+    // Prices and sizes must be DECIMAL, never DOUBLE: exchange values stay
+    // exact all the way into research.
+    for (const col of ['price', 'delta_count', 'yes_price', 'mid', 'spread']) {
+      expect(SILVER_COLUMN_TYPES[col], `${col} must be exact`).toMatch(/^DECIMAL/);
+    }
+  });
+
+  it('types every ordering key used by the silver layer', async () => {
+    const { SILVER_COLUMN_TYPES, SILVER_TABLES } = await import('@/src/persistence/silver');
+
+    // Anything a research query is likely to ORDER BY must be numeric.
+    for (const spec of SILVER_TABLES) {
+      for (const term of spec.orderBy.split(',')) {
+        const col = term.trim().split('.')[1];
+        if (!col || col === 'id' || col === 'trade_id' || col === 'snapshot_id') continue;
+        if (col === 'session_id') continue; // a UUID; lexicographic is fine
+        expect(SILVER_COLUMN_TYPES[col], `${spec.table}.${col} is an ordering key`).toBeDefined();
+      }
+    }
+  });
+});
