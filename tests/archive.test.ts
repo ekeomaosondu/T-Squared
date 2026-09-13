@@ -77,9 +77,36 @@ describe('archive store round trip', () => {
 });
 
 describe('archive backend selection', () => {
-  it('uses Vercel Blob when a token is present', () => {
+  it('uses PRIVATE Vercel Blob when a token is present', () => {
+    // A public archive would expose the whole order-book history to anyone
+    // with the URL.
     const sel = selectArchiveStore({ blobToken: 'vercel_blob_rw_test', mode: 'daemon' });
-    expect(sel.store.kind).toBe('vercel-blob');
+    expect(sel.store.kind).toBe('vercel-blob-private');
+  });
+
+  it('uses R2 when configured, since it charges no egress for repeated scans', () => {
+    const sel = selectArchiveStore({
+      blobToken: '',
+      mode: 'daemon',
+      storage: 'r2',
+      s3: {
+        bucket: 'kalshi',
+        endpoint: 'https://acct.r2.cloudflarestorage.com',
+        region: 'auto',
+        accessKeyId: 'key',
+        secretAccessKey: 'secret',
+      },
+    });
+    expect(sel.store.kind).toBe('r2');
+    expect(sel.durable).toBe(true);
+  });
+
+  it('refuses R2 without credentials rather than silently falling back', () => {
+    // Falling back to local disk would let retention later drop partitions
+    // believing they were archived.
+    expect(() =>
+      selectArchiveStore({ blobToken: '', mode: 'daemon', storage: 'r2' }),
+    ).toThrow(/requires ARCHIVE_BUCKET/);
   });
 
   it('allows a local backend in daemon mode', () => {

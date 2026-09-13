@@ -50,6 +50,14 @@ async function main(): Promise<void> {
   const { store } = selectArchiveStore({
     blobToken: e.BLOB_READ_WRITE_TOKEN,
     mode: e.COLLECTOR_MODE,
+    storage: e.ARCHIVE_STORAGE,
+    s3: {
+      bucket: e.ARCHIVE_BUCKET,
+      endpoint: e.ARCHIVE_ENDPOINT,
+      region: e.ARCHIVE_REGION,
+      accessKeyId: e.ARCHIVE_ACCESS_KEY_ID,
+      secretAccessKey: e.ARCHIVE_SECRET_ACCESS_KEY,
+    },
   });
 
   logger.info(

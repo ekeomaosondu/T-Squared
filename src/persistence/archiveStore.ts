@@ -72,7 +72,7 @@ export class LocalArchiveStore implements ArchiveStore {
 
 /** Vercel Blob backend. Loaded lazily so the daemon needs no Vercel packages. */
 export class VercelBlobStore implements ArchiveStore {
-  readonly kind = 'vercel-blob';
+  readonly kind = 'vercel-blob-private';
   private readonly urls = new Map<string, string>();
 
   constructor(private readonly token: string) {}
@@ -80,7 +80,9 @@ export class VercelBlobStore implements ArchiveStore {
   async put(objectPath: string, body: Buffer): Promise<StoredObject> {
     const { put } = await import('@vercel/blob');
     const result = await put(objectPath, body, {
-      access: 'public',
+      // PRIVATE. This is a proprietary dataset; a public archive would expose
+      // the entire order-book history to anyone with the URL.
+      access: 'private',
       token: this.token,
       contentType: 'application/gzip',
       // Archives are immutable and content-addressed by path; a random suffix
@@ -116,6 +118,87 @@ export class VercelBlobStore implements ArchiveStore {
   }
 }
 
+/**
+ * S3-compatible object storage: Cloudflare R2 or AWS S3.
+ *
+ * R2 is the intended target for the research lake. It charges no egress, which
+ * matters enormously when the workflow is repeatedly scanning Parquet from a
+ * workstation with DuckDB, and its S3 API means DuckDB can read directly from
+ * it without a separate download step.
+ */
+export class S3ArchiveStore implements ArchiveStore {
+  readonly kind: string;
+  private client: import('@aws-sdk/client-s3').S3Client | null = null;
+
+  constructor(
+    private readonly opts: {
+      bucket: string;
+      endpoint?: string;
+      region?: string;
+      accessKeyId: string;
+      secretAccessKey: string;
+      flavour?: 'r2' | 's3';
+    },
+  ) {
+    this.kind = opts.flavour ?? (opts.endpoint?.includes('r2.cloudflarestorage.com') ? 'r2' : 's3');
+  }
+
+  private async getClient() {
+    if (this.client) return this.client;
+    const { S3Client } = await import('@aws-sdk/client-s3');
+    this.client = new S3Client({
+      // R2 ignores region but the SDK requires one.
+      region: this.opts.region || 'auto',
+      endpoint: this.opts.endpoint || undefined,
+      credentials: {
+        accessKeyId: this.opts.accessKeyId,
+        secretAccessKey: this.opts.secretAccessKey,
+      },
+      // R2 does not support virtual-hosted-style addressing for all setups.
+      forcePathStyle: true,
+    });
+    return this.client;
+  }
+
+  async put(objectPath: string, body: Buffer): Promise<StoredObject> {
+    const { PutObjectCommand } = await import('@aws-sdk/client-s3');
+    const client = await this.getClient();
+    await client.send(
+      new PutObjectCommand({
+        Bucket: this.opts.bucket,
+        Key: objectPath,
+        Body: body,
+        ContentType: 'application/gzip',
+        // Integrity is verified independently by re-reading and hashing, but
+        // this lets the service reject a corrupted upload outright.
+        ChecksumSHA256: sha256(body).toString('base64'),
+      }),
+    );
+    return { path: objectPath, size: body.byteLength };
+  }
+
+  async get(objectPath: string): Promise<Buffer> {
+    const { GetObjectCommand } = await import('@aws-sdk/client-s3');
+    const client = await this.getClient();
+    const res = await client.send(
+      new GetObjectCommand({ Bucket: this.opts.bucket, Key: objectPath }),
+    );
+    if (!res.Body) throw new Error(`empty object: ${objectPath}`);
+    return Buffer.from(await res.Body.transformToByteArray());
+  }
+
+  async exists(objectPath: string): Promise<boolean> {
+    const { HeadObjectCommand } = await import('@aws-sdk/client-s3');
+    const client = await this.getClient();
+    try {
+      await client.send(new HeadObjectCommand({ Bucket: this.opts.bucket, Key: objectPath }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
 export interface StoreSelection {
   store: ArchiveStore;
   /** False when the backend cannot be trusted to outlive the process. */
@@ -133,8 +216,33 @@ export function selectArchiveStore(opts: {
   blobToken: string;
   mode: 'daemon' | 'vercel_rolling';
   localRoot?: string;
+  storage?: 'r2' | 's3' | 'vercel_blob' | 'local';
+  s3?: {
+    bucket: string;
+    endpoint: string;
+    region: string;
+    accessKeyId: string;
+    secretAccessKey: string;
+  };
 }): StoreSelection {
-  if (opts.blobToken) {
+  const storage = opts.storage ?? (opts.blobToken ? 'vercel_blob' : 'local');
+
+  if (storage === 'r2' || storage === 's3') {
+    const s3 = opts.s3;
+    if (!s3?.bucket || !s3.accessKeyId || !s3.secretAccessKey) {
+      throw new Error(
+        `ARCHIVE_STORAGE=${storage} requires ARCHIVE_BUCKET, ARCHIVE_ACCESS_KEY_ID and ` +
+          'ARCHIVE_SECRET_ACCESS_KEY. Without them the archive has nowhere durable to go, ' +
+          'and retention must never run against an archive that does not exist.',
+      );
+    }
+    return { store: new S3ArchiveStore({ ...s3, flavour: storage }), durable: true };
+  }
+
+  if (storage === 'vercel_blob' || opts.blobToken) {
+    if (!opts.blobToken) {
+      throw new Error('ARCHIVE_STORAGE=vercel_blob requires BLOB_READ_WRITE_TOKEN');
+    }
     return { store: new VercelBlobStore(opts.blobToken), durable: true };
   }
 

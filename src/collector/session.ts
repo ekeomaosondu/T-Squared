@@ -167,6 +167,14 @@ export class SessionRunner extends EventEmitter {
       const { store } = selectArchiveStore({
         blobToken: opts.env.BLOB_READ_WRITE_TOKEN,
         mode: opts.mode,
+        storage: opts.env.ARCHIVE_STORAGE,
+        s3: {
+          bucket: opts.env.ARCHIVE_BUCKET,
+          endpoint: opts.env.ARCHIVE_ENDPOINT,
+          region: opts.env.ARCHIVE_REGION,
+          accessKeyId: opts.env.ARCHIVE_ACCESS_KEY_ID,
+          secretAccessKey: opts.env.ARCHIVE_SECRET_ACCESS_KEY,
+        },
       });
       archiver = new ArchiveWorker({
         sql: opts.sql,
