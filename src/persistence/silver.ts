@@ -82,7 +82,7 @@ export const SILVER_TABLES: SilverTableSpec[] = [
     dayColumn: 's.received_at',
     select: `s.snapshot_id, s.session_id, s.stream_id, s.market_ticker, m.event_ticker,
              m.series_ticker, s.source, s.sid, s.seq, s.received_at_ms,
-             s.yes_bids::text AS yes_bids, s.no_bids::text AS no_bids,
+             s.yes_bids::text AS yes_bids_json, s.no_bids::text AS no_bids_json,
              s.yes_level_count, s.no_level_count,
              s.best_yes_bid, s.best_yes_bid_size, s.best_yes_ask, s.best_yes_ask_size,
              s.spread, s.mid, s.state_hash`,
