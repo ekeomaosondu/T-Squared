@@ -58,18 +58,30 @@ export interface KalshiWebSocketClientEvents {
   reconnecting: [{ attempt: number; delayMs: number; reason: string }];
 }
 
-export declare interface KalshiWebSocketClient {
-  on<K extends keyof KalshiWebSocketClientEvents>(
+export class KalshiWebSocketClient extends EventEmitter {
+  // Typed event surface. Declared as overrides rather than by merging an
+  // interface into the class, which is unsound in the general case.
+  override on<K extends keyof KalshiWebSocketClientEvents>(
     event: K,
     listener: (...args: KalshiWebSocketClientEvents[K]) => void,
-  ): this;
-  emit<K extends keyof KalshiWebSocketClientEvents>(
+  ): this {
+    return super.on(event, listener as (...args: unknown[]) => void);
+  }
+
+  override once<K extends keyof KalshiWebSocketClientEvents>(
+    event: K,
+    listener: (...args: KalshiWebSocketClientEvents[K]) => void,
+  ): this {
+    return super.once(event, listener as (...args: unknown[]) => void);
+  }
+
+  override emit<K extends keyof KalshiWebSocketClientEvents>(
     event: K,
     ...args: KalshiWebSocketClientEvents[K]
-  ): boolean;
-}
+  ): boolean {
+    return super.emit(event, ...args);
+  }
 
-export class KalshiWebSocketClient extends EventEmitter {
   private ws: WebSocket | null = null;
   private state: WsClientState = 'idle';
 

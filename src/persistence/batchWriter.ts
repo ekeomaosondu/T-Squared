@@ -72,12 +72,23 @@ export interface BatchWriterEvents {
   partitionMissing: [{ err: unknown }];
 }
 
-export declare interface BatchWriter {
-  on<K extends keyof BatchWriterEvents>(e: K, l: (...a: BatchWriterEvents[K]) => void): this;
-  emit<K extends keyof BatchWriterEvents>(e: K, ...a: BatchWriterEvents[K]): boolean;
-}
-
 export class BatchWriter extends EventEmitter {
+  // Typed event surface, declared as overrides rather than by merging an
+  // interface into the class.
+  override on<K extends keyof BatchWriterEvents>(
+    event: K,
+    listener: (...args: BatchWriterEvents[K]) => void,
+  ): this {
+    return super.on(event, listener as (...args: unknown[]) => void);
+  }
+
+  override emit<K extends keyof BatchWriterEvents>(
+    event: K,
+    ...args: BatchWriterEvents[K]
+  ): boolean {
+    return super.emit(event, ...args);
+  }
+
   private readonly sql: Sql;
   private readonly maxRows: number;
   private readonly maxWaitMs: number;

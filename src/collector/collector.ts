@@ -18,7 +18,6 @@ import type { KalshiWebSocketClient, RawFrame } from '@/src/kalshi/websocketClie
 import { SequenceTracker } from '@/src/integrity/sequenceTracker';
 import { BatchWriter } from '@/src/persistence/batchWriter';
 import type { Sql } from '@/src/persistence/db';
-import { toDate } from '@/src/persistence/convert';
 import {
   integrityRow,
   recordIntegrityEvent,
