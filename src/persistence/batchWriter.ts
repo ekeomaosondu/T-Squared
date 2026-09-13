@@ -365,6 +365,10 @@ export class BatchWriter extends EventEmitter {
           if (row.linkRawEvent && link) {
             row.values.raw_event_id = link.id;
             row.values.raw_event_received_at = link.received_at;
+            // Observation order, carried directly so silver exports need not
+            // join back to raw_ingest_events, which is deleted after its
+            // retention window.
+            if (unit.raw) row.values.ingest_ordinal = unit.raw.ingestOrdinal.toString();
           }
           pushRow(row);
         }
