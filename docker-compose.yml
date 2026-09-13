@@ -1,0 +1,41 @@
+# Local development database.
+#
+# Production uses Neon; nothing in the codebase is Neon-specific -- the only
+# difference is the DATABASE_URL. Postgres 17 matches Neon's current default
+# major version so partition behaviour (incl. DETACH CONCURRENTLY) matches.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: kalshi-recorder-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kalshi
+      POSTGRES_PASSWORD: kalshi
+      POSTGRES_DB: kalshi_recorder
+      # Deterministic collation so ORDER BY on tickers matches across machines.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      - "54329:5432"
+    command:
+      - postgres
+      # The ingest path is append-heavy and batched; give it room to breathe.
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - synchronous_commit=off
+      - -c
+      - log_min_duration_statement=2000
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kalshi -d kalshi_recorder"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - kalshi-pgdata:/var/lib/postgresql/data
+
+volumes:
+  kalshi-pgdata:
