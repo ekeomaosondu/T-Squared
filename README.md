@@ -21,9 +21,18 @@ recovery, normalized persistence, periodic sampling, synchronized event-ladder
 sampling, REST validation, integrity and health tables, offline replay, and
 immutable raw archival with verified retention.
 
-Hardened under fault injection: three abrupt socket terminations, two genuinely
-dropped frames, a database stall, and a collector restart mid-event, after
-which **888/888 recorded snapshots still reproduced exactly from raw deltas**.
+Hardened under a 45-minute fault-injected soak on the live four-city universe —
+6 abrupt socket terminations, 4 genuinely dropped frames, 2 database stalls and
+a collector restart mid-event — after which all 8 checks passed:
+
+```
+113,652 frames captured, 0 ingest_ordinal holes
+4 sequence gaps, all recorded and all recovered
+83,748/83,748 applied deltas exact, 0 negative levels
+32 streams, all closed cleanly, no duplicate subscriptions
+14,136/14,136 snapshots reproduced exactly across 24 markets
+RSS 113MB -> 97MB; peak write buffer 1,841 rows
+```
 
 Not yet built: Vercel rolling sessions / lease handoff, the export CLI, the
 monitoring dashboard, and the optional private order/fill and weather feeds.
@@ -635,10 +644,25 @@ collector restart mid-event producing a second capture epoch.
 - every session closed with an explicit reason
 - **replay equality**: every recorded snapshot reproduced exactly from raw deltas
 
-This is the gate for trusting the recorder unattended. Replay equality in
-particular should be treated as a mandatory invariant for any change touching
-ingestion, persistence, sequence handling or SQL ordering — every serious bug
-found so far was caught by it and by nothing else.
+This is the gate for trusting the recorder unattended.
+
+Replay equality is a **mandatory invariant** for any change touching ingestion,
+persistence, sequence handling or SQL ordering. Every serious defect found in
+this project was caught by it and by nothing else:
+
+| Defect | Symptom without replay equality |
+|---|---|
+| Raw log reordered by async DB work in the frame handler | none — ingestion looked healthy |
+| Deltas ordered by `seq::text` → 100, 101, 1111, 13, 130 | none — all rows present |
+| Streams interleaved by random UUID after a reconnect | none — only wrong after a reconnect |
+| Deltas in the seed snapshot's own millisecond dropped | none — rare and silent |
+
+CI (`.github/workflows/ci.yml`) therefore runs `tests/replayEquality.test.ts`
+against a real Postgres on every push: it drives the real collector, batch
+writer and database with a synthetic feed covering a random walk, a sequence gap
+with recovery, and a reconnect where `seq` restarts. `tests/sqlConventions.test.ts`
+backs it up by scanning the source for unqualified ordering keys and
+self-shadowing cast aliases.
 
 ---
 
