@@ -65,6 +65,7 @@ export function toRawIngestEvent(
   frame: RawFrame,
   sessionId: string,
   streamId: string | null,
+  ingestOrdinal: bigint,
   parseVersion = 1,
 ): RawIngestEvent {
   const env = frame.envelope;
@@ -74,6 +75,7 @@ export function toRawIngestEvent(
   return {
     sessionId,
     streamId,
+    ingestOrdinal,
     receivedAt: frame.receivedAt,
     receivedAtMs: BigInt(frame.receivedAtMs),
     recvMonotonicNs: frame.recvMonotonicNs,

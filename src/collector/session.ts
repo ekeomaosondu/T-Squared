@@ -35,6 +35,9 @@ import { logger } from '@/src/logging/logger';
 /** Delay before confirming a transient REST mismatch with a second check. */
 const VALIDATION_RECHECK_DELAY_MS = 1_500;
 
+/** Coalesces a burst of lifecycle events into a single discovery pass. */
+const DISCOVERY_DEBOUNCE_MS = 2_000;
+
 /**
  * One capture epoch, start to finish.
  *
@@ -83,6 +86,7 @@ export class SessionRunner extends EventEmitter {
   private handoffAnnounced = false;
   private sessionPersisted = false;
   private discovered = false;
+  private pendingDiscoveryTimer: NodeJS.Timeout | null = null;
 
   constructor(opts: SessionRunnerOptions) {
     super();
@@ -154,6 +158,13 @@ export class SessionRunner extends EventEmitter {
 
     this.collector.on('latency', (exchangeTsMs: bigint, receivedAtMs: bigint) => {
       this.observeLatency(exchangeTsMs, receivedAtMs);
+    });
+
+    // A lifecycle message can announce a new daily ladder. Pull discovery
+    // forward rather than waiting up to MARKET_DISCOVERY_INTERVAL_MS, while
+    // debouncing so a burst of lifecycle events causes one refresh.
+    this.collector.on('discoveryRefreshRequested', ({ reason }: { reason: string }) => {
+      this.requestDiscoverySoon(reason);
     });
 
     this.wireWriterEvents();
@@ -292,6 +303,10 @@ export class SessionRunner extends EventEmitter {
 
     for (const t of this.timers) clearInterval(t);
     this.timers = [];
+    if (this.pendingDiscoveryTimer) {
+      clearTimeout(this.pendingDiscoveryTimer);
+      this.pendingDiscoveryTimer = null;
+    }
 
     // Close the socket first so no new frames arrive mid-drain.
     await this.ws.close(1000, reason).catch(() => {});
@@ -370,6 +385,26 @@ export class SessionRunner extends EventEmitter {
       this.handoffAnnounced = true;
       this.emit('handoffRequested', { sessionId: this.sessionId, elapsedSeconds: this.elapsedSeconds });
     }
+  }
+
+  /**
+   * Debounced out-of-band discovery pass.
+   *
+   * Lifecycle parsing never establishes market relationships itself; it only
+   * prompts REST to re-read them sooner. Periodic polling remains the fallback
+   * if a lifecycle message is missed entirely.
+   */
+  private requestDiscoverySoon(reason: string): void {
+    if (this.pendingDiscoveryTimer) return;
+
+    this.pendingDiscoveryTimer = setTimeout(() => {
+      this.pendingDiscoveryTimer = null;
+      logger.info({ event: 'discovery_triggered', reason }, 'running out-of-band discovery');
+      void this.runDiscovery().catch((err) =>
+        logger.error({ event: 'discovery_failed', reason, err: String(err) }, 'out-of-band discovery failed'),
+      );
+    }, DISCOVERY_DEBOUNCE_MS);
+    this.pendingDiscoveryTimer.unref?.();
   }
 
   private async runDiscovery(): Promise<void> {

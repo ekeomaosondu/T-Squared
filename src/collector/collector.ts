@@ -16,6 +16,7 @@ import {
 } from '@/src/kalshi/schemas';
 import type { KalshiWebSocketClient, RawFrame } from '@/src/kalshi/websocketClient';
 import { SequenceTracker } from '@/src/integrity/sequenceTracker';
+import { StreamRecoveryMachine } from '@/src/integrity/recoveryStateMachine';
 import { BatchWriter } from '@/src/persistence/batchWriter';
 import type { Sql } from '@/src/persistence/db';
 import {
@@ -114,6 +115,8 @@ export class Collector extends EventEmitter {
   readonly marketState = new MarketStateCache();
   readonly sequences = new SequenceTracker();
   readonly subscriptions: SubscriptionManager;
+  /** Owns DEGRADED/RECOVERING transitions; see recoveryStateMachine.ts. */
+  readonly recovery = new StreamRecoveryMachine({ timeoutMs: RECOVERY_TIMEOUT_MS });
 
   readonly counters: CollectorCounters = {
     messagesReceived: 0,
@@ -139,12 +142,9 @@ export class Collector extends EventEmitter {
   private readonly sessionId: string;
   private readonly canWriteCanonical: () => boolean;
 
-  /** stream_id -> open recovery episode awaiting snapshots. */
-  private readonly pendingRecovery = new Map<
-    string,
-    { gapId: string | null; markets: Set<string>; requestedAtMs: number }
-  >();
   private readonly lastTickerMismatchAt = new Map<string, number>();
+  /** Monotonic observation counter for this session. */
+  private ingestOrdinal = 0n;
   private readonly lastSnapshotRequestAt = new Map<string, number>();
 
   /**
@@ -209,14 +209,16 @@ export class Collector extends EventEmitter {
    * with no record of why.
    */
   reapStalledRecoveries(nowMs = Date.now()): void {
-    for (const [streamId, episode] of this.pendingRecovery) {
-      if (nowMs - episode.requestedAtMs < RECOVERY_TIMEOUT_MS) continue;
-
-      this.pendingRecovery.delete(streamId);
-      const outstanding = [...episode.markets];
+    for (const episode of this.recovery.reapTimeouts(nowMs)) {
+      const outstanding = [...episode.outstanding];
 
       logger.error(
-        { event: 'recovery_timeout', stream_id: streamId, outstanding: outstanding.length },
+        {
+          event: 'recovery_timeout',
+          stream_id: episode.streamId,
+          outstanding: outstanding.length,
+          withheld: episode.messagesWithheld,
+        },
         'recovery snapshots never arrived; stream remains degraded',
       );
 
@@ -231,7 +233,11 @@ export class Collector extends EventEmitter {
           sessionId,
           type: 'recovery_failure',
           severity: 'critical',
-          details: { stream_id: streamId, outstanding_markets: outstanding },
+          details: {
+            stream_id: episode.streamId,
+            outstanding_markets: outstanding,
+            messages_withheld: episode.messagesWithheld,
+          },
         }).catch(() => {});
       });
     }
@@ -331,6 +337,7 @@ export class Collector extends EventEmitter {
           marketTickers: [...sub.markets],
         });
         this.sequences.register(sub.streamId, sub.channel);
+        this.recovery.register(sub.streamId);
         for (const m of sub.markets) this.books.associate(sub.streamId, m);
       }
     }
@@ -357,6 +364,7 @@ export class Collector extends EventEmitter {
             marketTickers: [...sub.markets],
           });
           this.sequences.register(sub.streamId, sub.channel);
+          this.recovery.register(sub.streamId);
         }
       }
       if (removed.length > 0) this.subscriptions.removeMarkets(channel, removed);
@@ -381,8 +389,9 @@ export class Collector extends EventEmitter {
     for (const sub of streams) {
       await closeStream(this.sql, sub.streamId).catch(() => {});
       this.sequences.remove(sub.streamId);
+      this.recovery.close(sub.streamId);
     }
-    this.pendingRecovery.clear();
+    this.recovery.reset();
 
     this.writer.enqueueDerived([
       integrityRow({
@@ -401,30 +410,27 @@ export class Collector extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private handleFrame(frame: RawFrame): void {
+    // FIRST statement. The socket layer emits synchronously, so this counter
+    // records true receipt order -- unlike `id`, which is assigned at flush
+    // time and carries no ordering meaning.
+    const ingestOrdinal = ++this.ingestOrdinal;
+
     this.counters.messagesReceived += 1;
 
     const env = frame.envelope;
     const messageType = env?.type ?? 'unparseable';
-
-    // Control-plane frames carry no market data.
-    if (messageType === 'subscribed') {
-      this.handleSubscribed(env);
-      return;
-    }
-    if (messageType === 'error') {
-      this.handleError(env);
-      return;
-    }
-    if (messageType === 'ok' || messageType === 'unsubscribed' || messageType === 'ping' || messageType === 'pong') {
-      return;
-    }
 
     const sub = env?.sid !== undefined && env.sid !== null ? this.subscriptions.bySidOrNull(env.sid) : null;
     const streamId = sub?.streamId ?? null;
     const channel = sub?.channel ?? channelForType(messageType);
 
     // ---- 1. Capture raw FIRST -------------------------------------------
-    const raw = toRawIngestEvent(frame, this.sessionId, streamId);
+    // EVERY frame is captured, including control frames. `subscribed` binds a
+    // sid and `error` is evidence of a rejected command; both belong in the
+    // record of what the socket delivered. Capturing all of them also keeps
+    // ingest_ordinal contiguous, which makes "did a frame go missing between
+    // receipt and durability?" a checkable question.
+    const raw = toRawIngestEvent(frame, this.sessionId, streamId, ingestOrdinal);
     const unit: IngestUnit = { raw, normalized: [] };
 
     // Exchange-to-receive latency, for messages that carried a usable
@@ -441,6 +447,22 @@ export class Collector extends EventEmitter {
           details: { parseError: frame.parseError, preview: frame.text.slice(0, 500) },
         }),
       );
+      this.writer.enqueue(unit);
+      return;
+    }
+
+    // Control-plane frames carry no market data, but are still recorded.
+    if (messageType === 'subscribed') {
+      this.handleSubscribed(env);
+      this.writer.enqueue(unit);
+      return;
+    }
+    if (messageType === 'error') {
+      this.handleError(env, unit);
+      this.writer.enqueue(unit);
+      return;
+    }
+    if (messageType === 'ok' || messageType === 'unsubscribed' || messageType === 'ping' || messageType === 'pong') {
       this.writer.enqueue(unit);
       return;
     }
@@ -463,8 +485,16 @@ export class Collector extends EventEmitter {
       } else if (verdict.verdict === 'degraded') {
         // A gap is already open on this stream. Only a recovery snapshot may
         // re-establish state; deltas are recorded but not applied.
+        this.recovery.withhold(streamId);
         applyAllowed = messageType === 'orderbook_snapshot';
         skipReason = 'stream degraded; awaiting recovery snapshot';
+      }
+
+      // Belt and braces: the machine is the authority on whether canonical
+      // state may advance, regardless of what the sequence verdict said.
+      if (applyAllowed && messageType !== 'orderbook_snapshot' && !this.recovery.canApplyDeltas(streamId)) {
+        applyAllowed = false;
+        skipReason ??= `stream ${this.recovery.stateOf(streamId)}; awaiting recovery snapshot`;
       }
     }
 
@@ -541,20 +571,21 @@ export class Collector extends EventEmitter {
     });
   }
 
-  private handleError(env: { msg?: unknown } | null): void {
+  private handleError(env: { msg?: unknown } | null, unit: IngestUnit): void {
     const msg = (env?.msg ?? {}) as { code?: number; msg?: string };
     logger.error(
       { event: 'ws_command_error', code: msg.code, message: msg.msg },
       'kalshi rejected a command',
     );
-    this.writer.enqueueDerived([
+    unit.normalized.push(
       integrityRow({
         sessionId: this.sessionId,
+        // 26 = per-subscription market limit, 27 = command rate limit.
         type: 'subscription_failure',
         severity: msg.code === 26 || msg.code === 27 ? 'error' : 'warning',
         details: { code: msg.code, message: msg.msg },
       }),
-    ]);
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -580,8 +611,22 @@ export class Collector extends EventEmitter {
     expectedSeq: bigint | null,
     receivedSeq: bigint | null,
   ): void {
+    const nowMs = Number(unit.raw.receivedAtMs);
+    const affected = this.books.marketsForStream(sub.streamId);
+
+    const { opened, episode } = this.recovery.openGap(sub.streamId, {
+      affected,
+      expectedSeq,
+      receivedSeq,
+      nowMs,
+    });
+
+    // An episode was already open: this frame is withheld, but it is not a new
+    // discontinuity and must not trigger another recovery.
+    if (!opened) return;
+
     const reason = `sequence gap on ${sub.channel}: expected ${expectedSeq}, received ${receivedSeq}`;
-    const affected = this.books.invalidateStream(sub.streamId, reason);
+    this.books.invalidateStream(sub.streamId, reason);
 
     unit.normalized.push(
       integrityRow({
@@ -612,37 +657,33 @@ export class Collector extends EventEmitter {
       'sequence gap detected; books invalidated and recovery requested',
     );
 
-    // Open the episode synchronously so concurrent frames see it immediately.
-    const episode = {
-      gapId: null as string | null,
-      markets: new Set(affected),
-      requestedAtMs: Date.now(),
-    };
-    this.pendingRecovery.set(sub.streamId, episode);
-
-    // Request snapshots once, now, without altering the subscription.
+    // Exactly one recovery request per episode, guarded by the machine.
     let requested = 0;
-    try {
-      if (affected.length > 0) {
+    if (affected.length > 0 && this.recovery.canRequestRecovery(sub.streamId)) {
+      try {
         requested = this.subscriptions.requestSnapshots(affected, 'orderbook_delta');
+      } catch (err) {
+        logger.error(
+          { event: 'recovery_request_failed', stream_id: sub.streamId, err: String(err) },
+          'failed to request recovery snapshots',
+        );
+        unit.normalized.push(
+          integrityRow({
+            sessionId: this.sessionId,
+            type: 'recovery_failure',
+            severity: 'critical',
+            details: { stream_id: sub.streamId, error: String(err) },
+          }),
+        );
       }
-    } catch (err) {
-      logger.error(
-        { event: 'recovery_request_failed', stream_id: sub.streamId, err: String(err) },
-        'failed to request recovery snapshots',
-      );
-      unit.normalized.push(
-        integrityRow({
-          sessionId: this.sessionId,
-          type: 'recovery_failure',
-          severity: 'critical',
-          details: { stream_id: sub.streamId, error: String(err) },
-        }),
-      );
     }
+
+    if (requested > 0) this.recovery.markRecoveryRequested(sub.streamId, nowMs);
+    else this.recovery.markRecoveryUnavailable(sub.streamId);
 
     const sessionId = this.sessionId;
     const sql = this.sql;
+    const recovering = requested > 0;
     this.defer(async () => {
       await setStreamStatus(sql, sub.streamId, 'degraded').catch(() => {});
       const gapId = await recordSequenceGap(sql, {
@@ -656,13 +697,11 @@ export class Collector extends EventEmitter {
       });
       episode.gapId = gapId;
 
-      if (requested > 0) {
+      if (recovering) {
         await markGapRecovering(sql, gapId);
         await setStreamStatus(sql, sub.streamId, 'recovering').catch(() => {});
       } else {
-        await markGapFailed(sql, gapId, 'no subscription available to request snapshots').catch(
-          () => {},
-        );
+        await markGapFailed(sql, gapId, 'no subscription available to request snapshots').catch(() => {});
       }
     });
 
@@ -673,21 +712,17 @@ export class Collector extends EventEmitter {
    * Closes a recovery episode once every affected market has produced a fresh
    * snapshot, re-baselining the stream's sequence.
    */
-  private completeRecovery(streamId: string, episode: { gapId: string | null; markets: Set<string> }, seq: number | null): void {
+  private completeRecovery(streamId: string, gapId: string | null, snapshots: number, seq: number | null): void {
     const skipped = this.sequences.resetAfterRecovery(streamId, seq);
-    this.pendingRecovery.delete(streamId);
 
     const sql = this.sql;
-    const snapshotCount = this.counters.snapshots;
     this.defer(async () => {
-      if (episode.gapId) {
-        await markGapRecovered(sql, episode.gapId, snapshotCount).catch(() => {});
-      }
+      if (gapId) await markGapRecovered(sql, gapId, snapshots).catch(() => {});
       await setStreamStatus(sql, streamId, 'healthy').catch(() => {});
     });
 
     logger.info(
-      { event: 'gap_recovered', stream_id: streamId, skippedWhileDegraded: skipped },
+      { event: 'gap_recovered', stream_id: streamId, snapshots, skippedWhileDegraded: skipped },
       'stream recovered from snapshot',
     );
   }
@@ -705,8 +740,11 @@ export class Collector extends EventEmitter {
     const msg = OrderbookSnapshotMsg.parse(env.msg);
     this.counters.snapshots += 1;
 
-    const recovery = streamId ? this.pendingRecovery.get(streamId) : undefined;
-    const isRecovery = !!recovery?.markets.has(msg.market_ticker);
+    const nowMs = Number(unit.raw.receivedAtMs);
+    const outcome = streamId
+      ? this.recovery.recordSnapshot(streamId, msg.market_ticker, nowMs)
+      : { relevant: false, completed: false, episode: null };
+    const isRecovery = outcome.relevant;
 
     const row = this.books.applySnapshot({
       marketTicker: msg.market_ticker,
@@ -723,15 +761,16 @@ export class Collector extends EventEmitter {
     });
     unit.normalized.push(row);
 
-    if (isRecovery && streamId && recovery) {
-      recovery.markets.delete(msg.market_ticker);
-
-      // Only re-baseline once the WHOLE affected set has been rebuilt: leaving
-      // the episode open until then keeps deltas for not-yet-recovered markets
-      // from being applied to a stale book.
-      if (recovery.markets.size === 0) {
-        this.completeRecovery(streamId, recovery, env.seq ?? null);
-      }
+    // Only re-baseline once the WHOLE affected set has been rebuilt: leaving the
+    // episode open until then keeps deltas for not-yet-recovered markets from
+    // being applied to a stale book.
+    if (outcome.completed && streamId && outcome.episode) {
+      this.completeRecovery(
+        streamId,
+        outcome.episode.gapId,
+        outcome.episode.snapshotsReceived,
+        env.seq ?? null,
+      );
     }
   }
 
@@ -966,6 +1005,14 @@ export class Collector extends EventEmitter {
       // must trigger an immediate metadata refresh.
       if (METADATA_REFRESH_TRIGGERS.has(msg.event_type)) {
         this.universe.queueMetadataRefresh(msg.market_ticker);
+        // Lifecycle parsing is NOT authoritative for market relationships; it
+        // only prompts REST to re-establish the official series/event/market
+        // links sooner than the polling interval would. Polling remains the
+        // fallback if this message is missed entirely.
+        this.emit('discoveryRefreshRequested', {
+          reason: `lifecycle:${msg.event_type}`,
+          marketTicker: msg.market_ticker,
+        });
         logger.info(
           { event: 'lifecycle_metadata_refresh_queued', market_ticker: msg.market_ticker, lifecycle: msg.event_type },
           'queued metadata refresh from lifecycle event',
@@ -996,7 +1043,13 @@ export class Collector extends EventEmitter {
       },
     });
 
-    if (eventTicker) this.universe.queueEventRefresh(eventTicker);
+    if (eventTicker) {
+      this.universe.queueEventRefresh(eventTicker);
+      // A new event is how a new daily ladder announces itself; pull it in
+      // promptly rather than waiting for the next discovery tick. REST still
+      // establishes the official relationships.
+      this.emit('discoveryRefreshRequested', { reason: `event_lifecycle`, eventTicker });
+    }
   }
 
   // -------------------------------------------------------------------------

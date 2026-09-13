@@ -10,6 +10,16 @@ export interface RawIngestEvent {
   sessionId: string;
   streamId?: string | null;
 
+  /**
+   * In-process counter assigned synchronously at socket receipt, before any
+   * asynchronous work. Records the order this process OBSERVED frames.
+   * Monotonic within a session; meaningless across sessions.
+   *
+   * `id` is provenance identity assigned at flush time and must never be used
+   * for ordering.
+   */
+  ingestOrdinal: bigint;
+
   receivedAt: Date;
   receivedAtMs: bigint;
   recvMonotonicNs: bigint;

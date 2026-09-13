@@ -296,6 +296,7 @@ export class BatchWriter extends EventEmitter {
         const rawRows = withRaw.map((u) => ({
           session_id: u.raw.sessionId,
           stream_id: u.raw.streamId ?? null,
+          ingest_ordinal: u.raw.ingestOrdinal.toString(),
           received_at: u.raw.receivedAt,
           received_at_ms: u.raw.receivedAtMs.toString(),
           recv_monotonic_ns: u.raw.recvMonotonicNs.toString(),

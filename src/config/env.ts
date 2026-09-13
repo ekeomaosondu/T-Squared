@@ -43,6 +43,14 @@ const EnvSchema = z.object({
   REST_BOOK_VALIDATION_INTERVAL_MS: int(60_000),
 
   RAW_DB_RETENTION_HOURS: int(48),
+  /**
+   * Master switch for DESTRUCTIVE partition removal.
+   *
+   * Defaults to false and must stay false until archival exists and has
+   * verified a partition's row count and SHA-256. Until then there is nowhere
+   * for dropped raw data to go, so retention would simply destroy it.
+   */
+  RAW_DB_RETENTION_ENABLED: bool(false),
   RAW_ARCHIVE_ENABLED: bool(true),
   RAW_PARTITION_AHEAD_DAYS: int(7),
   RAW_PARTITION_MAINTENANCE_INTERVAL_MS: int(3_600_000),

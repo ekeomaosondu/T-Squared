@@ -26,9 +26,20 @@ class RecordingWriter {
     return this.units.flatMap((u) => u.normalized).concat(this.derived).filter((r) => r.table === table);
   }
   get rawSeqs(): (string | null)[] {
-    return this.units.map((u) => (u.raw?.seq === null || u.raw?.seq === undefined ? null : u.raw.seq.toString()));
+    return this.dataUnits.map((u) => (u.raw?.seq === null || u.raw?.seq === undefined ? null : u.raw.seq.toString()));
+  }
+  /** Market-data frames only; control frames are captured too but are noise here. */
+  get dataUnits(): IngestUnit[] {
+    return this.units.filter(
+      (u) => !CONTROL_TYPES.has(u.raw?.messageType ?? ''),
+    );
+  }
+  get ordinals(): string[] {
+    return this.units.map((u) => u.raw.ingestOrdinal.toString());
   }
 }
+
+const CONTROL_TYPES = new Set(['subscribed', 'unsubscribed', 'ok', 'error', 'ping', 'pong']);
 
 function makeCollector(overrides: { capture?: Record<string, boolean>; tracked?: string[] } = {}) {
   const ws = new FakeWebSocketClient();
@@ -82,10 +93,10 @@ describe('Collector raw capture', () => {
     c.ws.deliver(snapshotFrame({ sid, seq: 1, ticker: TICKER, yes: [['0.4200', '150.00']] }));
     c.ws.deliver(deltaFrame({ sid, seq: 2, ticker: TICKER, side: 'yes', price: '0.4200', delta: '50.00' }));
 
-    expect(c.writer.units).toHaveLength(2);
+    expect(c.writer.dataUnits).toHaveLength(2);
     expect(c.writer.units.every((u) => u.raw && u.raw.payloadHash.length === 32)).toBe(true);
     // The payload is the verbatim envelope.
-    expect((c.writer.units[0]!.raw.payload as { type: string }).type).toBe('orderbook_snapshot');
+    expect((c.writer.dataUnits[0]!.raw.payload as { type: string }).type).toBe('orderbook_snapshot');
   });
 
   it('preserves arrival order in the raw log', async () => {
@@ -105,13 +116,39 @@ describe('Collector raw capture', () => {
     expect(c.writer.rowsFor('integrity_events')).toHaveLength(1);
   });
 
+  it('captures control frames too, so the raw log is complete', async () => {
+    // Section 9: every incoming message is written before it counts as
+    // captured. `subscribed` binds a sid and `error` is evidence of a rejected
+    // command; both belong in the record of what the socket delivered.
+    await connect(c);
+    const types = c.writer.units.map((u) => u.raw.messageType);
+    expect(types.filter((t) => t === 'subscribed')).toHaveLength(4);
+
+    c.ws.deliver({ type: 'error', sid: 1, msg: { code: 26, msg: 'market limit exceeded' } });
+    expect(c.writer.units.at(-1)!.raw.messageType).toBe('error');
+    expect(c.writer.rowsFor('integrity_events').at(-1)!.values.type).toBe('subscription_failure');
+  });
+
+  it('assigns a contiguous ingest ordinal to every observed frame', async () => {
+    await connect(c);
+    const sid = 1;
+    c.ws.deliver(snapshotFrame({ sid, seq: 1, ticker: TICKER, yes: [['0.4200', '150.00']] }));
+    c.ws.deliver(deltaFrame({ sid, seq: 2, ticker: TICKER, side: 'yes', price: '0.4200', delta: '1.00' }));
+    c.ws.deliverRaw('{not json');
+
+    // Contiguity from 1 is what makes ingest_ordinal usable as a durability
+    // check: a hole means a frame was observed but never persisted.
+    const ordinals = c.writer.ordinals.map(Number);
+    expect(ordinals).toEqual(Array.from({ length: ordinals.length }, (_, i) => i + 1));
+  });
+
   it('captures a raw event even when normalisation fails', async () => {
     const sid = await connect(c);
     // A delta missing required fields: the raw frame must survive regardless.
     c.ws.deliver({ type: 'orderbook_delta', sid, seq: 1, msg: { market_ticker: TICKER } });
 
-    expect(c.writer.units).toHaveLength(1);
-    expect(c.writer.units[0]!.raw.messageType).toBe('orderbook_delta');
+    expect(c.writer.dataUnits).toHaveLength(1);
+    expect(c.writer.dataUnits[0]!.raw.messageType).toBe('orderbook_delta');
     expect(c.writer.rowsFor('integrity_events')[0]!.values.type).toBe('unexpected_schema');
   });
 });
@@ -190,7 +227,7 @@ describe('Collector sequence gap and recovery', () => {
     expect(applied).toHaveLength(0);
 
     // But every message is still captured raw.
-    expect(c.writer.units).toHaveLength(23);
+    expect(c.writer.dataUnits).toHaveLength(23);
   });
 
   it('returns to healthy only after every affected market is re-snapshotted', async () => {
@@ -279,7 +316,7 @@ describe('Collector lifecycle scoping', () => {
     const sid = await connect(c);
     c.ws.deliver(lifecycleFrame({ sid: sid + 3, seq: 1, ticker: 'KXMLBGAME-26SEP13-ABC', eventType: 'settled' }));
 
-    expect(c.writer.units).toHaveLength(1);
+    expect(c.writer.dataUnits).toHaveLength(1);
     expect(c.writer.rowsFor('market_lifecycle_events')).toHaveLength(0);
     expect(c.universe.queueMetadataRefresh).not.toHaveBeenCalled();
   });
