@@ -163,17 +163,49 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
   // Recorded gaps first, so the caller knows up front whether this window was
   // captured from an uninterrupted stream or stitched after a recovery.
   result.gapsInWindow = await sql`
-    SELECT detected_at, session_id, stream_id, expected_seq::text, received_seq::text, status
+    SELECT detected_at,
+           session_id,
+           stream_id,
+           expected_seq::text AS expected_seq,
+           received_seq::text AS received_seq,
+           status
       FROM sequence_gaps
      WHERE detected_at BETWEEN to_timestamp(${Number(fromMs) / 1000}) AND to_timestamp(${Number(toMs) / 1000})
        AND affected_markets @> ${JSON.stringify([marketTicker])}::jsonb
-     ORDER BY detected_at
+     ORDER BY sequence_gaps.detected_at
   `;
 
-  const seed = await findSeedSnapshot(sql, marketTicker, fromMs);
+  let seed = await findSeedSnapshot(sql, marketTicker, fromMs);
+
+  // If the window starts before this market has any recorded state, fall back
+  // to its first snapshot inside the window and say so, rather than returning
+  // nothing. Different markets in one event are first snapshotted milliseconds
+  // apart, so a window pinned to the earliest snapshot across an event would
+  // otherwise fail for every market except the first.
+  if (!seed) {
+    const later = await sql<SnapshotRow[]>`
+      SELECT snapshot_id, market_ticker, source, session_id, stream_id, sid, seq,
+             received_at, received_at_ms, yes_bids, no_bids, state_hash
+        FROM orderbook_snapshots
+       WHERE market_ticker = ${marketTicker}
+         AND received_at_ms > ${fromMs.toString()}
+         AND received_at_ms <= ${toMs.toString()}
+         AND source IN ('ws_initial', 'ws_recovery', 'session_handoff', 'local_materialized')
+       ORDER BY received_at_ms
+       LIMIT 1
+    `;
+    seed = later[0] ?? null;
+    if (seed) {
+      result.warnings.push(
+        `no snapshot at or before ${new Date(Number(fromMs)).toISOString()}; ` +
+          `replay starts at ${new Date(Number(seed.received_at_ms)).toISOString()} instead`,
+      );
+    }
+  }
+
   if (!seed) {
     result.warnings.push(
-      `no snapshot at or before ${new Date(Number(fromMs)).toISOString()}; cannot seed replay`,
+      `no snapshot for ${marketTicker} in or before the requested window; cannot seed replay`,
     );
     return result;
   }
@@ -206,15 +238,30 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
      ORDER BY received_at_ms
   `;
 
+  // NOTE: the ORDER BY must reference the underlying BIGINT columns, not the
+  // ::text output aliases. `seq::text` takes the default alias `seq`, and
+  // Postgres resolves a bare ORDER BY name to the OUTPUT column first -- which
+  // sorts sequence numbers lexicographically (100, 101, 1111, 13, 130) and
+  // applies deltas in the wrong order. Hence the explicit table qualification.
   const deltas = await sql<DeltaRow[]>`
-    SELECT id::text, session_id, stream_id, seq::text, side, price::text,
-           delta_count::text, applied, apply_error,
-           received_at_ms::text, exchange_ts_ms::text
+    SELECT id::text            AS id,
+           session_id,
+           stream_id,
+           seq::text           AS seq,
+           side,
+           price::text         AS price,
+           delta_count::text   AS delta_count,
+           applied,
+           apply_error,
+           received_at_ms::text AS received_at_ms,
+           exchange_ts_ms::text AS exchange_ts_ms
       FROM orderbook_deltas
      WHERE market_ticker = ${marketTicker}
        AND received_at_ms > ${seed.received_at_ms}
        AND received_at_ms <= ${toMs.toString()}
-     ORDER BY session_id, stream_id, seq
+     ORDER BY orderbook_deltas.session_id,
+              orderbook_deltas.stream_id,
+              orderbook_deltas.seq
   `;
 
   let snapIdx = 0;
@@ -366,7 +413,7 @@ export async function verifyReplay(
        AND received_at_ms >= ${fromMs.toString()}
        AND received_at_ms <= ${toMs.toString()}
        AND seq IS NOT NULL
-     ORDER BY received_at_ms
+     ORDER BY orderbook_snapshots.received_at_ms
      LIMIT ${limit}
   `;
 
