@@ -60,7 +60,7 @@ async function seedRawEvents(sessionId: string, day: Date, count: number, channe
 
 beforeAll(async () => {
   if (!available) return;
-  sql = await freshTestDb();
+  sql = await freshTestDb('archive');
   root = await mkdtemp(path.join(tmpdir(), 'kx-archive-int-'));
   store = new LocalArchiveStore(root);
 });

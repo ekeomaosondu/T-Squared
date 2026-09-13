@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    # Replay equality is a database-backed property, so CI runs a real
+    # Postgres. It is the invariant that caught every serious defect in this
+    # project -- a reordered raw log, deltas applied in lexicographic sequence
+    # order, and streams interleaved by UUID after a reconnect -- each of which
+    # left the application looking perfectly healthy.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: kalshi
+          POSTGRES_PASSWORD: kalshi
+          POSTGRES_DB: kalshi_recorder_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U kalshi"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      TEST_DATABASE_URL: postgres://kalshi:kalshi@localhost:5432/kalshi_recorder_test
+      LOG_LEVEL: silent
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npx eslint src scripts tests
+
+      - name: Tests
+        # Includes tests/replayEquality.test.ts, which drives the real
+        # collector, batch writer and database with a synthetic feed covering
+        # sequence gaps and reconnects, then reconstructs every book from the
+        # recorded delta stream and compares state hashes. A change to
+        # ingestion, persistence, sequence handling or SQL ordering that breaks
+        # reconstruction fails here.
+        run: npm test
+
+      - name: Build
+        run: npm run build

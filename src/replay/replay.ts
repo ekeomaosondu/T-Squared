@@ -259,7 +259,7 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
       SELECT d2.stream_id, min(d2.received_at_ms) AS first_ms
         FROM orderbook_deltas d2
        WHERE d2.market_ticker = ${marketTicker}
-         AND d2.received_at_ms > ${seed.received_at_ms}
+         AND d2.received_at_ms >= ${seed.received_at_ms}
          AND d2.received_at_ms <= ${toMs.toString()}
        GROUP BY d2.stream_id
     )
@@ -278,7 +278,7 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
       JOIN stream_first sf ON sf.stream_id = d.stream_id
       LEFT JOIN subscription_streams st ON st.stream_id = d.stream_id
      WHERE d.market_ticker = ${marketTicker}
-       AND d.received_at_ms > ${seed.received_at_ms}
+       AND d.received_at_ms >= ${seed.received_at_ms}
        AND d.received_at_ms <= ${toMs.toString()}
      ORDER BY COALESCE(
                 EXTRACT(EPOCH FROM st.started_at) * 1000,
@@ -287,6 +287,44 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
               d.stream_id,
               d.seq
   `;
+
+  // The delta window is now inclusive of the seed's millisecond, because at
+  // realistic message rates several events share one millisecond and a strict
+  // `>` silently dropped those that followed the snapshot within it. Position
+  // relative to the seed is therefore decided by (stream order, seq) rather
+  // than by the timestamp alone.
+  const streamOrder = new Map<string, number>();
+  for (const d of deltas) {
+    if (!streamOrder.has(d.stream_id)) streamOrder.set(d.stream_id, streamOrder.size);
+  }
+  const seedSeq = seed.seq === null ? null : BigInt(seed.seq);
+  const seedStreamIndex =
+    seed.stream_id !== null && streamOrder.has(seed.stream_id)
+      ? streamOrder.get(seed.stream_id)!
+      : null;
+
+  /**
+   * Should this snapshot be applied before this delta?
+   *
+   * Timestamps alone are not enough: a recovery snapshot and the deltas that
+   * follow it routinely share a millisecond at realistic message rates, and
+   * applying the snapshot first would discard the very deltas it precedes.
+   * Within a millisecond, the exchange's own sequence decides.
+   */
+  const snapshotPrecedes = (snap: SnapshotRow, delta: DeltaRow): boolean => {
+    const sMs = BigInt(snap.received_at_ms);
+    const dMs = BigInt(delta.received_at_ms);
+    if (sMs !== dMs) return sMs <= dMs;
+
+    if (snap.stream_id !== null && snap.stream_id === delta.stream_id && snap.seq !== null) {
+      return BigInt(snap.seq) <= BigInt(delta.seq);
+    }
+
+    const si = snap.stream_id === null ? undefined : streamOrder.get(snap.stream_id);
+    const di = streamOrder.get(delta.stream_id);
+    if (si !== undefined && di !== undefined) return si <= di;
+    return true;
+  };
 
   let snapIdx = 0;
   let stoppedAtBound = false;
@@ -310,6 +348,16 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
   for (const delta of deltas) {
     const atMs = BigInt(delta.received_at_ms);
 
+    // Skip anything at or before the seed's own position.
+    if (seedStreamIndex !== null) {
+      const idx = streamOrder.get(delta.stream_id)!;
+      if (idx < seedStreamIndex) continue;
+      if (idx === seedStreamIndex && seedSeq !== null && BigInt(delta.seq) <= seedSeq) continue;
+    } else if (atMs === BigInt(seed.received_at_ms) && seedSeq !== null && BigInt(delta.seq) <= seedSeq) {
+      // Seed's stream is unknown; fall back to comparing sequence directly.
+      continue;
+    }
+
     // Stop at the target position.
     //
     // `seq` restarts on every reconnect, so a later stream's deltas carry LOW
@@ -330,7 +378,7 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
     }
 
     // Re-seed from any snapshot that precedes this delta.
-    while (snapIdx < laterSnapshots.length && BigInt(laterSnapshots[snapIdx]!.received_at_ms) <= atMs) {
+    while (snapIdx < laterSnapshots.length && snapshotPrecedes(laterSnapshots[snapIdx]!, delta)) {
       const snap = laterSnapshots[snapIdx]!;
       snapIdx += 1;
 
