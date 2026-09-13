@@ -51,7 +51,7 @@ const EnvSchema = z.object({
   DB_BATCH_MAX_WAIT_MS: int(250),
   DB_BUFFER_MAX_ROWS: int(200_000),
 
-  LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
+  LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']).default('info'),
   LOG_PRETTY: bool(false),
 
   INTERNAL_API_TOKEN: z.string().optional().default(''),

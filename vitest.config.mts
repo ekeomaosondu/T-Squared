@@ -9,6 +9,9 @@ export default defineConfig({
   test: {
     include: ['tests/**/*.test.ts'],
     environment: 'node',
+    // Structured logs are verified by their own assertions, not by eyeballing
+    // test output.
+    env: { LOG_LEVEL: 'silent', LOG_PRETTY: 'false' },
     testTimeout: 30_000,
     hookTimeout: 60_000,
   },

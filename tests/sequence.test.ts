@@ -67,15 +67,34 @@ describe('SequenceTracker', () => {
     expect(tracker.get(STREAM)!.degraded).toBe(true);
   });
 
-  it('does not advance past a gap, so the next message is still measured against the last good seq', () => {
+  it('reports one gap per discontinuity, not one per subsequent message', () => {
     tracker.observe(STREAM, CH, 100);
-    tracker.observe(STREAM, CH, 105); // gap
-    const next = tracker.observe(STREAM, CH, 106);
+    expect(tracker.observe(STREAM, CH, 105).verdict).toBe('gap');
 
-    // Still anchored to 100: we have not accepted 105 as good state.
-    expect(next.verdict).toBe('gap');
-    expect(next.expectedSeq).toBe(101n);
-    expect(tracker.get(STREAM)!.gapCount).toBe(2);
+    // Once a gap is open the baseline is stale, so continuity cannot be
+    // re-evaluated. Subsequent messages are withheld from the book and counted,
+    // but are not further gaps: re-reporting them buried the real event and,
+    // because each report triggered a recovery request, fed a snapshot storm.
+    for (const seq of [106, 107, 108]) {
+      const r = tracker.observe(STREAM, CH, seq);
+      expect(r.verdict).toBe('degraded');
+    }
+
+    const state = tracker.get(STREAM)!;
+    expect(state.gapCount).toBe(1);
+    expect(state.skippedWhileDegraded).toBe(3);
+    // Still anchored to the last known-good sequence.
+    expect(state.lastSeq).toBe(100n);
+  });
+
+  it('reports how many messages were withheld when recovery completes', () => {
+    tracker.observe(STREAM, CH, 100);
+    tracker.observe(STREAM, CH, 105);
+    tracker.observe(STREAM, CH, 106);
+    tracker.observe(STREAM, CH, 107);
+
+    expect(tracker.resetAfterRecovery(STREAM, 200)).toBe(2);
+    expect(tracker.get(STREAM)!.skippedWhileDegraded).toBe(0);
   });
 
   it('returns to healthy only after a recovery snapshot re-baselines the stream', () => {
