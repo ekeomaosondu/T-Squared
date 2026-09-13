@@ -48,7 +48,9 @@ describe('SQL ordering conventions', () => {
         for (const rawTerm of clause.split(',')) {
           const term = rawTerm
             .replace(/\b(ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST)\b/gi, '')
-            .replace(/\)+$/, '')
+            // Cut at the close paren that ends an enclosing OVER (...) window
+            // clause, so `ORDER BY r.seq) AS prev` is read as `r.seq`.
+            .replace(/\)[\s\S]*$/, '')
             .trim();
           if (!term) continue;
           // Interpolations, literals, positional refs and function calls are fine.
@@ -121,5 +123,45 @@ describe('sequence ordering regression', () => {
     // lastSeq must end on the numerically largest, not the lexicographic one.
     expect(book.lastSeq).toBe(1111n);
     expect(book.yesBids.get('0.500000')!.eq(new Decimal(36))).toBe(true);
+  });
+});
+
+describe('batch insert ordering', () => {
+  it('inserts parent tables before their children', async () => {
+    const { orderedTables } = await import('@/src/persistence/batchWriter');
+
+    // Children can otherwise reach the database first, since tables are
+    // inserted group-by-group. Found by soak testing across a restart.
+    const byTable = new Map<string, unknown>([
+      ['event_ladder_samples', []],
+      ['orderbook_deltas', []],
+      ['event_ladder_sample_groups', []],
+    ]);
+
+    const order = orderedTables(byTable as never);
+    expect(order.indexOf('event_ladder_sample_groups')).toBeLessThan(
+      order.indexOf('event_ladder_samples'),
+    );
+    expect(order).toContain('orderbook_deltas');
+  });
+});
+
+describe('ladder sample group identity', () => {
+  it('is deterministic, so re-sampling a bucket is idempotent', async () => {
+    const { ladderGroupId } = await import('@/src/sampling/ladderSampler');
+
+    const a = ladderGroupId('KXHIGHNY-26SEP14', 1000, 1_789_325_000_000);
+    const b = ladderGroupId('KXHIGHNY-26SEP14', 1000, 1_789_325_000_000);
+    expect(a).toBe(b);
+    expect(a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  });
+
+  it('differs across event, interval and bucket', async () => {
+    const { ladderGroupId } = await import('@/src/sampling/ladderSampler');
+    const base = ladderGroupId('KXHIGHNY-26SEP14', 1000, 1_789_325_000_000);
+
+    expect(ladderGroupId('KXHIGHNY-26SEP15', 1000, 1_789_325_000_000)).not.toBe(base);
+    expect(ladderGroupId('KXHIGHNY-26SEP14', 5000, 1_789_325_000_000)).not.toBe(base);
+    expect(ladderGroupId('KXHIGHNY-26SEP14', 1000, 1_789_325_001_000)).not.toBe(base);
   });
 });

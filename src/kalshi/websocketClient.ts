@@ -92,6 +92,17 @@ export class KalshiWebSocketClient extends EventEmitter {
   private reconnectAttempt = 0;
   private shuttingDown = false;
 
+  /**
+   * FAULT INJECTION ONLY. When set, a frame for which this returns false is
+   * discarded as though the network had lost it.
+   *
+   * This exists so the soak test can create a real sequence discontinuity --
+   * the only honest way to prove gap detection and recovery work end to end,
+   * since a synthetic gap constructed further downstream would bypass the very
+   * code paths under test. Never set in normal operation.
+   */
+  private frameFilter: ((envelope: WsEnvelope | null) => boolean) | null = null;
+
   private readonly opts: Required<Omit<WebSocketClientOptions, 'signer' | 'webSocketImpl'>> & {
     signer: KalshiSigner;
     webSocketImpl: typeof WebSocket;
@@ -120,6 +131,23 @@ export class KalshiWebSocketClient extends EventEmitter {
 
   get isOpen(): boolean {
     return this.state === 'open' && this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  /** FAULT INJECTION ONLY. See {@link frameFilter}. */
+  setFrameFilter(filter: ((envelope: WsEnvelope | null) => boolean) | null): void {
+    this.frameFilter = filter;
+    if (filter) {
+      logger.warn(
+        { event: 'frame_filter_installed' },
+        'FAULT INJECTION: a frame filter is installed; frames may be discarded',
+      );
+    }
+  }
+
+  /** Forcibly drops the transport, simulating an abrupt network failure. */
+  forceDisconnect(reason = 'fault injection'): void {
+    logger.warn({ event: 'force_disconnect', reason }, 'FAULT INJECTION: terminating socket');
+    this.ws?.terminate();
   }
 
   /** Monotonically increasing command id, echoed back in responses. */
@@ -199,6 +227,14 @@ export class KalshiWebSocketClient extends EventEmitter {
         else parseError = parsed.error.issues.map((i) => i.message).join('; ');
       } catch (err) {
         parseError = err instanceof Error ? err.message : String(err);
+      }
+
+      if (this.frameFilter && !this.frameFilter(envelope)) {
+        logger.warn(
+          { event: 'frame_dropped', seq: envelope?.seq ?? undefined, type: envelope?.type },
+          'FAULT INJECTION: frame discarded before delivery',
+        );
+        return;
       }
 
       this.emit('frame', {

@@ -240,11 +240,29 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
      ORDER BY s.received_at_ms
   `;
 
-  // The ordering key is the exchange-supplied `seq`, read as the underlying
-  // BIGINT. No display casts appear here at all: the driver already returns
-  // int8 and numeric as strings, so casting would only risk an output alias
-  // shadowing the source column. See the SQL ordering rule in persistence/db.ts.
+  // Ordering is (stream chronology, exchange seq).
+  //
+  // `seq` is scoped to a subscription and RESTARTS on every reconnect, so a
+  // session that reconnected contains several streams with overlapping seq
+  // ranges. stream_id is a random UUID, so ordering by it interleaves those
+  // streams arbitrarily -- invisible with a single stream, catastrophic after
+  // a reconnect. Streams are therefore ordered by when they began, and seq
+  // orders within a stream.
+  //
+  // The stream's own started_at is authoritative; the per-market first
+  // observation is a fallback for a delta whose stream row is unavailable.
+  //
+  // No display casts: the driver already returns int8 and numeric as strings,
+  // so a cast would only risk an output alias shadowing the source column.
   const deltas = await sql<DeltaRow[]>`
+    WITH stream_first AS (
+      SELECT d2.stream_id, min(d2.received_at_ms) AS first_ms
+        FROM orderbook_deltas d2
+       WHERE d2.market_ticker = ${marketTicker}
+         AND d2.received_at_ms > ${seed.received_at_ms}
+         AND d2.received_at_ms <= ${toMs.toString()}
+       GROUP BY d2.stream_id
+    )
     SELECT d.id,
            d.session_id,
            d.stream_id,
@@ -257,13 +275,22 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
            d.received_at_ms,
            d.exchange_ts_ms
       FROM orderbook_deltas d
+      JOIN stream_first sf ON sf.stream_id = d.stream_id
+      LEFT JOIN subscription_streams st ON st.stream_id = d.stream_id
      WHERE d.market_ticker = ${marketTicker}
        AND d.received_at_ms > ${seed.received_at_ms}
        AND d.received_at_ms <= ${toMs.toString()}
-     ORDER BY d.session_id, d.stream_id, d.seq
+     ORDER BY COALESCE(
+                EXTRACT(EPOCH FROM st.started_at) * 1000,
+                sf.first_ms
+              ),
+              d.stream_id,
+              d.seq
   `;
 
   let snapIdx = 0;
+  let stoppedAtBound = false;
+  let reachedTargetStream = opts.toSeqStream == null;
   let nextSampleMs = opts.sampleMs ? (fromMs / BigInt(opts.sampleMs)) * BigInt(opts.sampleMs) : null;
 
   const emit = (atMs: bigint) => {
@@ -283,12 +310,23 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
   for (const delta of deltas) {
     const atMs = BigInt(delta.received_at_ms);
 
-    if (
-      opts.toSeq !== undefined &&
-      BigInt(delta.seq) > opts.toSeq &&
-      (opts.toSeqStream == null || delta.stream_id === opts.toSeqStream)
-    ) {
-      break;
+    // Stop at the target position.
+    //
+    // `seq` restarts on every reconnect, so a later stream's deltas carry LOW
+    // sequence numbers. Comparing seq alone lets them stream past the bound
+    // unnoticed; the stream identity has to end the replay too.
+    if (opts.toSeq !== undefined) {
+      const onTargetStream = opts.toSeqStream == null || delta.stream_id === opts.toSeqStream;
+      if (onTargetStream && BigInt(delta.seq) > opts.toSeq) {
+        stoppedAtBound = true;
+        break;
+      }
+      if (!onTargetStream && reachedTargetStream) {
+        // We have moved past the target's stream entirely.
+        stoppedAtBound = true;
+        break;
+      }
+      if (onTargetStream) reachedTargetStream = true;
     }
 
     // Re-seed from any snapshot that precedes this delta.
@@ -296,13 +334,16 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
       const snap = laterSnapshots[snapIdx]!;
       snapIdx += 1;
 
-      const newEpoch = snap.session_id !== currentSession;
+      // A reconnect opens a NEW stream whose seq restarts, so a stream change
+      // is an epoch boundary just as a session change is.
+      const newEpoch = snap.session_id !== currentSession || snap.stream_id !== currentStream;
       book = bookFromSnapshot(marketTicker, snap);
       currentSession = snap.session_id ?? currentSession;
       currentStream = snap.stream_id;
 
       if (newEpoch || snap.source === 'session_handoff') {
-        // A new session is a new sequence space; never carry state across.
+        // A new session or stream is a new sequence space; never carry state
+        // across one.
         epoch = {
           sessionId: currentSession,
           streamId: currentStream,
@@ -354,6 +395,37 @@ export async function replay(sql: Sql, opts: ReplayOptions): Promise<ReplayResul
     result.appliedDeltas += 1;
     epoch.deltasApplied += 1;
     emit(atMs);
+  }
+
+  // A snapshot can land after the final delta -- most often a reconnect's
+  // ws_initial with no further trading before the window closes. The re-seed
+  // loop only runs while processing deltas, so drain the remainder here.
+  if (!stoppedAtBound) {
+    while (snapIdx < laterSnapshots.length) {
+      const snap = laterSnapshots[snapIdx]!;
+      if (BigInt(snap.received_at_ms) > toMs) break;
+      snapIdx += 1;
+
+      const newEpoch = snap.session_id !== currentSession || snap.stream_id !== currentStream;
+      book = bookFromSnapshot(marketTicker, snap);
+      currentSession = snap.session_id ?? currentSession;
+      currentStream = snap.stream_id;
+
+      if (newEpoch || snap.source === 'session_handoff') {
+        epoch = {
+          sessionId: currentSession,
+          streamId: currentStream,
+          startedAtMs: BigInt(snap.received_at_ms),
+          seedSnapshotId: snap.snapshot_id,
+          seedSource: snap.source,
+          deltasApplied: 0,
+          deltasSkipped: 0,
+          gaps: 0,
+        };
+        result.epochs.push(epoch);
+      }
+      emit(BigInt(snap.received_at_ms));
+    }
   }
 
   // Flush any remaining sample buckets up to the requested end.
@@ -426,10 +498,13 @@ export async function verifyReplay(
     // not used as re-seed points during replay, so they cannot short-circuit
     // the comparison. The bound is the snapshot's sequence number, which is
     // exact where a millisecond timestamp is not.
+    // The window ends AT the target instant. Materialised snapshots carry the
+    // true sampling time, so this is exact; toSeq only disambiguates events
+    // sharing the final millisecond.
     const r = await replay(sql, {
       marketTicker,
       fromMs,
-      toMs: atMs + 60_000n,
+      toMs: atMs,
       toSeq: target.seq === null ? undefined : BigInt(target.seq),
       toSeqStream: target.stream_id,
     });

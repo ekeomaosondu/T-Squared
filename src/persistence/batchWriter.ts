@@ -38,6 +38,21 @@ const JSONB_COLUMNS: Partial<Record<NormalizedTable, readonly string[]>> = {
   external_observations: ['raw'],
 };
 
+/**
+ * Insert order within a flush.
+ *
+ * Tables are grouped by name and inserted table-by-table, so a child row can
+ * reach the database before its parent unless the order is pinned. The only
+ * foreign key among batched tables is
+ * event_ladder_samples -> event_ladder_sample_groups, but ordering everything
+ * explicitly means adding a related pair later cannot silently reintroduce the
+ * problem. Tables not listed here are inserted afterwards in encounter order.
+ */
+const TABLE_INSERT_ORDER: readonly NormalizedTable[] = [
+  'event_ladder_sample_groups',
+  'event_ladder_samples',
+];
+
 /** Per-table conflict handling. Duplicates are expected and are not errors. */
 const CONFLICT_CLAUSE: Partial<Record<NormalizedTable, string>> = {
   // A repeated transport frame must not produce a second delta row; the
@@ -355,7 +370,8 @@ export class BatchWriter extends EventEmitter {
         }
       }
 
-      for (const [table, rows] of byTable) {
+      for (const table of orderedTables(byTable)) {
+        const rows = byTable.get(table)!;
         if (rows.length === 0) continue;
         const aligned = alignColumns(rows);
         const conflict = CONFLICT_CLAUSE[table] ?? '';
@@ -465,6 +481,14 @@ interface Aligned {
  * Rows for one table may carry different optional columns. Align them to the
  * union of keys, filling gaps with null, so a single multi-row INSERT works.
  */
+/** Parents first, then everything else in encounter order. */
+export function orderedTables(byTable: Map<NormalizedTable, unknown>): NormalizedTable[] {
+  const present = [...byTable.keys()];
+  const ranked = TABLE_INSERT_ORDER.filter((t) => byTable.has(t));
+  const rest = present.filter((t) => !TABLE_INSERT_ORDER.includes(t));
+  return [...ranked, ...rest];
+}
+
 export function alignColumns(rows: Record<string, unknown>[]): Aligned {
   const columns = [...new Set(rows.flatMap((r) => Object.keys(r)))];
   return {

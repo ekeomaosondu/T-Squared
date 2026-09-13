@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import type { BookManager } from '@/src/book/bookManager';
 import { PRICE_DP, SIZE_DP, toNumeric } from '@/src/book/decimal';
 import { hashLadderState } from '@/src/book/hashing';
@@ -79,7 +79,7 @@ export class LadderSampler {
         // strikes reflect the same moment.
         const frozen = this.books.snapshotAll(markets.map((m) => m.market_ticker));
 
-        const groupId = randomUUID();
+        const groupId = ladderGroupId(eventTicker, intervalMs, bucket);
         const sampleRows: NormalizedRow[] = [];
         const hashInputs: [string, string | null][] = [];
         let captured = 0;
@@ -147,4 +147,31 @@ export class LadderSampler {
 
     return { rows, groups };
   }
+}
+
+/**
+ * Deterministic group id for one (event, interval, bucket).
+ *
+ * A random id meant that re-sampling a bucket -- which happens whenever a
+ * collector restarts, since the in-memory dedupe resets while the row persists
+ * -- inserted a group that hit ON CONFLICT DO NOTHING while its child samples
+ * still referenced the new id, violating the foreign key. Deriving the id makes
+ * the whole group idempotent.
+ *
+ * Formatted as a v8 (custom) UUID: the value carries no randomness and should
+ * not claim to be v4.
+ */
+export function ladderGroupId(eventTicker: string, intervalMs: number, bucketMs: number): string {
+  const digest = createHash('sha256')
+    .update(`${eventTicker}|${intervalMs}|${bucketMs}`, 'utf8')
+    .digest('hex');
+
+  const version = '8';
+  const variant = ((parseInt(digest.slice(16, 17), 16) & 0x3) | 0x8).toString(16);
+
+  return (
+    `${digest.slice(0, 8)}-${digest.slice(8, 12)}-` +
+    `${version}${digest.slice(13, 16)}-` +
+    `${variant}${digest.slice(17, 20)}-${digest.slice(20, 32)}`
+  );
 }
