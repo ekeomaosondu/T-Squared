@@ -87,11 +87,58 @@ class MarketBookView implements BookView {
   get lastUpdateMs(): number {
     return this.book.lastUpdateAtMs;
   }
+  /**
+   * Best bid and offer, by a single linear scan of each ladder.
+   *
+   * `MarketBook.getYesBBO()` sorts both ladders to take their first element,
+   * which is the right shape for the recorder -- it wants the sorted levels
+   * anyway -- and the wrong shape here. The backtest asks for the BBO on every
+   * delta, so a full day means several million sorts of a fifty-level map, and
+   * they dominate the run.
+   *
+   * The values are identical: sorting price-descending and taking the head is
+   * the same thing as taking the maximum. The ladder accessors below still
+   * delegate, so there is exactly one implementation of everything that is not
+   * a maximum.
+   */
   bbo(): YesBbo {
-    return this.book.getYesBBO();
+    const best = (levels: ReadonlyMap<string, Decimal>): [Decimal, Decimal] | null => {
+      let price: Decimal | null = null;
+      let size: Decimal | null = null;
+      for (const [key, value] of levels) {
+        if (value.isZero()) continue;
+        const candidate = new Decimal(key);
+        if (price === null || candidate.gt(price)) {
+          price = candidate;
+          size = value;
+        }
+      }
+      return price === null ? null : [price, size!];
+    };
+
+    const bestBid = best(this.book.yesBids);
+    const bestNoBid = best(this.book.noBids);
+
+    const bid = bestBid?.[0] ?? null;
+    const bidSize = bestBid?.[1] ?? null;
+    // The highest NO bid is the lowest YES ask: an ask at 1 - q.
+    const ask = bestNoBid === null ? null : ONE.minus(bestNoBid[0]);
+    const askSize = bestNoBid?.[1] ?? null;
+
+    // Both sides required; a one-sided book yields null rather than an
+    // imputed value.
+    const spread = bid && ask ? ask.minus(bid) : null;
+    const mid = bid && ask ? bid.plus(ask).div(2) : null;
+
+    return { bid, bidSize, ask, askSize, spread, mid };
   }
+
   microprice(): Decimal | null {
-    return this.book.getMicroprice();
+    const { bid, ask, bidSize, askSize } = this.bbo();
+    if (!bid || !ask || !bidSize || !askSize) return null;
+    const denom = bidSize.plus(askSize);
+    if (denom.isZero()) return null;
+    return ask.mul(bidSize).plus(bid.mul(askSize)).div(denom);
   }
   depth(k: number): { bid: Decimal; ask: Decimal } {
     return this.book.getDepth(k);

@@ -497,9 +497,14 @@ export class BacktestEngine {
   }
 
   private mark(atMs: bigint): void {
+    // Only markets the portfolio actually holds. The mark grid fires once a
+    // second for the whole run, and pricing all two dozen markets each time --
+    // when the strategy is flat in most of them -- is the second largest cost
+    // in a full-day backtest after applying the deltas themselves.
     const marks = new Map<string, Decimal | null>();
-    for (const view of this.state.views()) {
-      marks.set(view.marketTicker, view.valid ? view.bbo().mid : null);
+    for (const position of this.portfolio.allPositions()) {
+      const view = this.state.view(position.marketTicker);
+      marks.set(position.marketTicker, view?.valid ? view.bbo().mid : null);
     }
     this.portfolio.mark(atMs, marks);
     this.equityCurve.push(this.portfolio.equityRow(atMs, marks));
