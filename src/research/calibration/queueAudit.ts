@@ -248,6 +248,52 @@ function pearson(xs: readonly number[], ys: readonly number[]): number | null {
 const percentile = (sorted: readonly number[], q: number): number | null =>
   sorted.length === 0 ? null : sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]!;
 
+export interface MoveEvidence {
+  /** Positive means the queue advanced: contracts ahead went away. */
+  deltaQ: number;
+  /** Fall in displayed size at our own price, over the same interval. */
+  deltaSame: number;
+  /** Fall in depth at better prices, over the same interval. */
+  deltaBetter: number;
+  /** Public volume executed at or better than our price. */
+  executedAhead: number;
+  /** Smallest residual any candidate lag alignment achieved. */
+  bestLagResidual: number;
+}
+
+/**
+ * Attributes one queue move to a public cause.
+ *
+ * Order matters and encodes what we are willing to claim. A trade is the least
+ * ambiguous explanation, so it is checked first. Better-priced depth is only
+ * credited when it actually moved -- otherwise every move at the touch, where
+ * better depth is constantly zero, would be attributed to it for free. A lag
+ * alignment is the LAST resort, because a search over dozens of candidate
+ * offsets will eventually fit something in a busy book, and calling that an
+ * explanation without saying so would be the easiest way to talk ourselves
+ * into a false result.
+ */
+export function classifyMove(e: MoveEvidence): MoveClass {
+  const unshifted = e.deltaSame + e.deltaBetter;
+
+  if (Math.abs(e.deltaQ) < EXPLAINED_TOLERANCE) {
+    // Not a real move. Still labelled, so the counts stay comparable.
+    return Math.abs(unshifted) < EXPLAINED_TOLERANCE
+      ? 'SAME_LEVEL_EXPLAINED'
+      : 'STILL_UNEXPLAINED';
+  }
+  if (Math.abs(e.deltaQ - e.executedAhead) < EXPLAINED_TOLERANCE) return 'TRADE_EXPLAINED';
+  if (
+    Math.abs(e.deltaBetter) >= EXPLAINED_TOLERANCE &&
+    Math.abs(e.deltaQ - unshifted) < EXPLAINED_TOLERANCE
+  ) {
+    return 'BETTER_LEVEL_EXPLAINED';
+  }
+  if (Math.abs(e.deltaQ - e.deltaSame) < EXPLAINED_TOLERANCE) return 'SAME_LEVEL_EXPLAINED';
+  if (e.bestLagResidual < EXPLAINED_TOLERANCE) return 'POSSIBLE_TIMING_ALIAS';
+  return 'STILL_UNEXPLAINED';
+}
+
 export async function auditQueueSemantics(
   sql: Sql,
   opts: AuditOptions = {},
@@ -388,28 +434,13 @@ export async function auditQueueSemantics(
       ) {
         zeroLagExplained += 1;
       }
-      let classification: MoveClass;
-      if (Math.abs(deltaQ) < EXPLAINED_TOLERANCE) {
-        // No meaningful move; classified by whatever the book says anyway so
-        // the counts below stay comparable.
-        classification =
-          Math.abs(unshiftedPredicted) < EXPLAINED_TOLERANCE
-            ? 'SAME_LEVEL_EXPLAINED'
-            : 'STILL_UNEXPLAINED';
-      } else if (Math.abs(deltaQ - executedAhead) < EXPLAINED_TOLERANCE) {
-        classification = 'TRADE_EXPLAINED';
-      } else if (
-        Math.abs(deltaBetter) >= EXPLAINED_TOLERANCE &&
-        Math.abs(deltaQ - unshiftedPredicted) < EXPLAINED_TOLERANCE
-      ) {
-        classification = 'BETTER_LEVEL_EXPLAINED';
-      } else if (Math.abs(deltaQ - deltaSame) < EXPLAINED_TOLERANCE) {
-        classification = 'SAME_LEVEL_EXPLAINED';
-      } else if (bestResidual < EXPLAINED_TOLERANCE) {
-        classification = 'POSSIBLE_TIMING_ALIAS';
-      } else {
-        classification = 'STILL_UNEXPLAINED';
-      }
+      const classification = classifyMove({
+        deltaQ,
+        deltaSame,
+        deltaBetter,
+        executedAhead,
+        bestLagResidual: bestResidual,
+      });
 
       if (
         Math.abs(deltaQ) >= EXPLAINED_TOLERANCE &&

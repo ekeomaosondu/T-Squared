@@ -531,17 +531,61 @@ from the exchange at startup, not from process memory. Book invalid, private
 feed down, persistence failing, an ambiguous order or any risk breach stops new
 probes; a breach never crosses the spread to flatten.
 
-### First results (38 probes, 20 minutes)
+### What `queue_position_fp` actually measures
+
+The first run left 20 of 24 queue moves unexplained against a same-price
+model. `npm run calibrate -- queue-audit` rebuilds the **full ladder** from the
+collector's own recorded deltas over each probe's life — which is what a raw
+archive is for; the better-price depth was never captured at poll time and did
+not need to be — and classifies every reported move by what public event
+explains it.
+
+Over 44 probes and 4,202 transitions:
+
+```
+nonzero reported moves                31
+  explained by public trades           1    3%
+  explained by better levels           0    0%
+  explained by same level              5   16%
+  explained with lag adjustment       22   71%
+  still unexplained                    3   10%
+
+explained at ZERO lag                  6      <- the null model
+median inferred queue lag            400 ms
+p90 inferred queue lag               800 ms
+
+corr(reported Q, better + same)    0.878
+corr(reported Q, same level only)  0.940
+```
+
+**Unexplained fell from 83% to 10%, and the cause is timing, not better-priced
+depth.** The endpoint is a lagged view: zero-lag explains 6 moves, best-lag
+explains 28, and the inferred lags concentrate in 400–800 ms — matching the
+independently measured 815 ms before a new order becomes visible at all. Two
+measurements of different things agreeing is the reason to believe it.
+
+Adding better-priced depth makes the correlation **worse** (0.878 vs 0.940).
+The honest caveat: 28 of 31 moves happened while the probe was still at the
+touch, where better depth is zero by construction, so this sample cannot
+strongly test the better-price hypothesis — it can only say the hypothesis is
+unnecessary to explain what was seen. The behind-the-BBO bucket is where 2 of
+the 3 remaining unexplained moves live, and it has 3 observations.
+
+So the same-level FIFO reading survives, and `conservative_queue`'s α = 0 is
+supported: same-level cancellations happen constantly (0.5 contracts/step) and
+almost never advance the queue.
+
+### Execution results (53 probes)
 
 Measured latency, which is what should eventually replace the 0/50/100/250 ms
 sweep:
 
 ```
 operation                    n    p50    p90    p99
-submit                      38     40     82     87
-cancel                      29     40    209    543
-private ack after HTTP ack  38      2      5     15
-queue visible after ack     37    816   1616   1804
+submit                      53     40     82    641
+cancel                      41     38    206    543
+private ack after HTTP ack  53      2      7    365
+queue visible after ack     52    815   1446   2184
 ```
 
 That last row is the non-obvious one: the exchange does not report a new
@@ -551,9 +595,9 @@ Fill models against the same real orders:
 
 ```
 model                  n   TP   FP   FN   TN   fill-time err   queue bias
-conservative_queue    38    6    0    3   29          122 ms        +2.2
-queue_decay           38    6    0    3   29          122 ms        +2.2
-touch                 38    9    3    0   26       10,154 ms       -43.3
+conservative_queue    53    6    0    5   42          122 ms        +1.3
+queue_decay           53    6    0    5   42          122 ms        +1.3
+touch                 53   11    3    0   39        8,898 ms       -46.2
 ```
 
 `conservative_queue` produced **no false positives** and a 122 ms fill-time
@@ -564,24 +608,10 @@ spread capture and PnL at once, silently.
 One probe filled from **66.8 contracts back in the queue**, which no
 conservative model would predict.
 
-Queue movement against the visible book, over 2,567 observation steps:
-
-```
-steps where Q moved         24
-mean removed per step     0.50
-UNEXPLAINED moves           20
-```
-
-Cancellations at our level happen constantly and almost never advance our
-queue — which is the assumption `conservative_queue` is built on, and the first
-evidence for it. But 20 of the 24 actual queue moves came with no trade and no
-withdrawal visible at that price, so market-by-price data is missing most of
-what moves the queue. **That is the first thing to investigate**, and it has to
-be resolved before any α is fitted: a parameter fitted to four explained moves
-would be noise with a decimal point.
-
-Thirty-eight probes is a pilot, not a dataset. Every figure above is printed
-with its sample size for that reason.
+Fifty-three probes is a pilot, not a dataset. Every figure above is printed
+with its sample size for that reason, and no α has been fitted: the progression
+is queue definition, then timestamp semantics, then a constructed public-ahead
+quantity, then the residual — and only then a model.
 
 ---
 
