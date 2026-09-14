@@ -212,3 +212,40 @@ describe('silver Parquet column typing', () => {
     }
   });
 });
+
+describe('bind parameter limits', () => {
+  it('chunks statements below the Postgres 65,535 parameter cap', async () => {
+    const { maxRowsPerStatement, chunkRows } = await import('@/src/persistence/batchWriter');
+
+    // A multi-row INSERT uses one parameter per column per row. Exceeding the
+    // cap raises MAX_PARAMETERS_EXCEEDED, which is NOT retryable -- so the
+    // flush would fail forever and the buffer would grow without bound.
+    for (const columns of [1, 5, 18, 40, 200]) {
+      const perStatement = maxRowsPerStatement(columns);
+      expect(perStatement * columns).toBeLessThanOrEqual(65_535);
+      expect(perStatement).toBeGreaterThan(0);
+    }
+  });
+
+  it('splits a burst into statements that each fit', async () => {
+    const { chunkRows, maxRowsPerStatement } = await import('@/src/persistence/batchWriter');
+
+    // The size that actually failed in production: a restore replaying a whole
+    // archived partition through the writer in one go.
+    const rows = Array.from({ length: 80_555 }, (_, i) => ({ i }));
+    const columns = 18;
+    const chunks = chunkRows(rows, columns);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const c of chunks) expect(c.length * columns).toBeLessThanOrEqual(65_535);
+    // No rows lost or duplicated in the split.
+    expect(chunks.reduce((n, c) => n + c.length, 0)).toBe(rows.length);
+    expect(chunks[0]!.length).toBe(maxRowsPerStatement(columns));
+  });
+
+  it('leaves a small batch as a single statement', async () => {
+    const { chunkRows } = await import('@/src/persistence/batchWriter');
+    const rows = Array.from({ length: 500 }, (_, i) => ({ i }));
+    expect(chunkRows(rows, 18)).toHaveLength(1);
+  });
+});

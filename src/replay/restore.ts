@@ -133,6 +133,19 @@ export async function restoreAndVerify(opts: RestoreOptions): Promise<RestoreRes
   };
 
   // ---- 1. read the archive back, checking every checksum -----------------
+  // The partition's own time bounds. A single-partition restore can only
+  // reconstruct state WITHIN that window, so comparisons must be bounded by it.
+  const bounds = await sourceSql<{ partition_start: Date; partition_end: Date }[]>`
+    SELECT s.partition_start, s.partition_end
+      FROM raw_partition_archive_state s
+     WHERE s.partition_name = ${partitionName}
+  `;
+  if (bounds.length === 0) {
+    throw new Error(`no archive state recorded for ${partitionName}`);
+  }
+  const partitionStart = bounds[0]!.partition_start;
+  const partitionEnd = bounds[0]!.partition_end;
+
   const manifests = await sourceSql<
     { blob_path: string; sha256: Buffer; row_count: string }[]
   >`
@@ -290,6 +303,11 @@ export async function restoreAndVerify(opts: RestoreOptions): Promise<RestoreRes
        AND s.seq IS NOT NULL
        AND s.stream_id IS NOT NULL
        AND s.stream_id = ANY(${[...streamMap.keys()]}::uuid[])
+       -- Only snapshots inside the restored partition's window. A session can
+       -- span midnight, and its later snapshots belong to the NEXT partition;
+       -- this restore has no data for those and could never reach them.
+       AND s.received_at >= ${partitionStart}
+       AND s.received_at < ${partitionEnd}
      ORDER BY s.market_ticker, s.received_at_ms
   `;
 

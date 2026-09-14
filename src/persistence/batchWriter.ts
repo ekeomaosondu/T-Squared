@@ -54,6 +54,33 @@ const TABLE_INSERT_ORDER: readonly NormalizedTable[] = [
 ];
 
 /** Per-table conflict handling. Duplicates are expected and are not errors. */
+/**
+ * Postgres accepts at most 65,535 bind parameters per statement.
+ *
+ * A multi-row INSERT uses one parameter per column per row, so a large enough
+ * batch exceeds it -- and MAX_PARAMETERS_EXCEEDED is not retryable, so the
+ * flush would fail forever and the buffer would grow without bound. This is
+ * reachable in normal operation: it is exactly what a database stall produces,
+ * since the buffer is designed to keep growing rather than drop events.
+ *
+ * Statements are therefore chunked by parameter count, with headroom.
+ */
+const MAX_BIND_PARAMETERS = 60_000;
+
+/** Largest row count that keeps one statement under the parameter limit. */
+export function maxRowsPerStatement(columnCount: number): number {
+  return Math.max(1, Math.floor(MAX_BIND_PARAMETERS / Math.max(1, columnCount)));
+}
+
+/** Splits rows into statement-sized chunks. */
+export function chunkRows<T>(rows: T[], columnCount: number): T[][] {
+  const size = maxRowsPerStatement(columnCount);
+  if (rows.length <= size) return [rows];
+  const out: T[][] = [];
+  for (let i = 0; i < rows.length; i += size) out.push(rows.slice(i, i + size));
+  return out;
+}
+
 const CONFLICT_CLAUSE: Partial<Record<NormalizedTable, string>> = {
   // A repeated transport frame must not produce a second delta row; the
   // duplicate is still preserved in raw_ingest_events.
@@ -243,7 +270,11 @@ export class BatchWriter extends EventEmitter {
         break;
       } catch (err) {
         this.stats.errors += 1;
-        this.emit('error', { err, attempt, bufferedRows: rowCount });
+        // EventEmitter throws on an unhandled 'error' event, which would turn a
+        // recoverable write failure into a process crash.
+        if (this.listenerCount('error') > 0) {
+          this.emit('error', { err, attempt, bufferedRows: rowCount });
+        }
 
         if (isMissingPartitionError(err)) {
           // Partition maintenance has failed. Retrying will not help until a
@@ -330,10 +361,19 @@ export class BatchWriter extends EventEmitter {
           parse_version: u.raw.parseVersion,
         }));
 
-        const returned = await tx<{ id: string; received_at: Date }[]>`
-          INSERT INTO raw_ingest_events ${tx(rawRows)}
-          RETURNING id, received_at
-        `;
+        // Chunked to stay under the bind-parameter limit. Ordering across
+        // chunks is preserved because the identity sequence hands ids out in
+        // statement order and the results are sorted by id afterwards.
+        const columnCount = Object.keys(rawRows[0] ?? {}).length;
+        const returned: { id: string; received_at: Date }[] = [];
+
+        for (const chunk of chunkRows(rawRows, columnCount)) {
+          const part = await tx<{ id: string; received_at: Date }[]>`
+            INSERT INTO raw_ingest_events ${tx(chunk)}
+            RETURNING id, received_at
+          `;
+          returned.push(...part);
+        }
 
         if (returned.length !== withRaw.length) {
           throw new Error(
@@ -377,12 +417,17 @@ export class BatchWriter extends EventEmitter {
       for (const table of orderedTables(byTable)) {
         const rows = byTable.get(table)!;
         if (rows.length === 0) continue;
-        const aligned = alignColumns(rows);
+
         const conflict = CONFLICT_CLAUSE[table] ?? '';
-        await tx.unsafe(
-          `INSERT INTO ${table} ${buildValuesPlaceholder(aligned, JSONB_COLUMNS[table])} ${conflict}`,
-          flattenValues(aligned),
-        );
+        const columnCount = new Set(rows.flatMap((r) => Object.keys(r))).size;
+
+        for (const chunk of chunkRows(rows, columnCount)) {
+          const aligned = alignColumns(chunk);
+          await tx.unsafe(
+            `INSERT INTO ${table} ${buildValuesPlaceholder(aligned, JSONB_COLUMNS[table])} ${conflict}`,
+            flattenValues(aligned),
+          );
+        }
       }
     });
 
