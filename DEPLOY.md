@@ -90,6 +90,45 @@ once. A brief gap in collection is the correct trade — a gap is visible in
 `sequence_gaps` and in session boundaries, whereas overlapping collectors
 produce two epochs that look valid individually and cannot be reconciled.
 
+## Deploying with the commit baked in
+
+Always `npm run deploy:fly`, never a bare `fly deploy`.
+
+`.dockerignore` excludes `.git`, so the working-tree fallback in
+`gitCommitSha()` returns null inside the container and every session records
+`git_commit_sha = NULL`. That loses the link between a window of the dataset
+and the code that produced it, on exactly the sessions where it matters most.
+`deploy:fly` passes the SHA as a build argument and marks a dirty tree; the
+deploy gate asserts the recorded value so it cannot regress silently.
+
+## Enabling retention
+
+Retention is DESTRUCTIVE and both switches are off. Turn them on only after a
+**full day** has passed the archive/restore gate — not a partial partition. A
+full day is the first time the gate runs at production scale, with multiple
+part files and a session spanning midnight.
+
+```bash
+# 1. Wait for the partition to close at 00:00 UTC. Do not manufacture it.
+#    The daemon's archive worker seals and uploads within the hour; confirm:
+curl -s https://kalshi-market-recorder.fly.dev/health | grep archive_currency
+
+# 2. The gate. Reads the archived bytes back out of R2, verifies every
+#    checksum, replays the frames through the REAL collector, and compares the
+#    reconstructed books against the independently recorded snapshot hashes.
+#    This, not the upload, is the acceptance criterion.
+npm run restore -- --partition raw_ingest_events_YYYY_MM_DD
+
+# 3. Only if that prints PASS:
+fly secrets set RAW_DB_RETENTION_ENABLED=true NORMALIZED_RETENTION_ENABLED=true
+npm run deploy:fly
+```
+
+Normalized retention is separately gated in code: it deletes a day only once
+every silver export for that day is verified, and does nothing at all when no
+exports are recorded. So enabling it before running `npm run silver` is inert
+rather than dangerous.
+
 ## Rotating the R2 credentials
 
 The archive credentials are long-lived and only rotate on purpose. Rotate them
