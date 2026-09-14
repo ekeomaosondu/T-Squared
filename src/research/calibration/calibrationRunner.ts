@@ -24,11 +24,14 @@ import {
 import { ticksFromTouch } from '@/src/book/ladder';
 import {
   assessEligibility,
+  cellId,
   chooseDwellMs,
   chooseSide,
+  selectLeastSampledCell,
   selectNext,
   stratumId,
   type Candidate,
+  type DesignCell,
 } from '@/src/research/calibration/marketSelector';
 import {
   isKilled,
@@ -80,6 +83,35 @@ export interface CalibrationConfig {
   /** Placed orders are suppressed. Everything else runs. */
   dryRun: boolean;
   /**
+   * Rest DELIBERATELY BEHIND the touch, at these distances in ticks.
+   *
+   * The v0 experiment answered the at-the-touch case: same-level FIFO, alpha
+   * near zero, most apparent movement a timing artefact. It could not test
+   * whether better-priced depth counts toward the reported queue, because a
+   * probe at the touch has none in front of it by construction.
+   *
+   * Placing behind the touch is the only way to create that condition on
+   * purpose. Empty means the v0 behaviour: join the touch.
+   */
+  behindTouchTicks?: number[];
+  /** Dwell choices. Behind-touch runs want the long ones. */
+  dwellChoicesMs?: readonly number[];
+  /**
+   * Refuse a target level with nothing already resting on it.
+   *
+   * An order alone at a price has a queue of zero and stays there; it teaches
+   * nothing about FIFO. The experiment needs somebody ahead of us.
+   */
+  requireRestingAtTarget?: boolean;
+  /**
+   * Stop once this many informative queue moves have been seen.
+   *
+   * The stopping rule is the OBSERVATION count, not the probe count. Probes
+   * are the cost; nonzero queue changes while genuinely behind the touch are
+   * the yield, and they arrive at a rate no probe budget can predict.
+   */
+  targetInformativeMoves?: number;
+  /**
    * Break stratum ties toward markets whose touch moves often.
    *
    * For the diagnostic run that has to produce observations where our probe
@@ -115,6 +147,8 @@ interface ActiveProbe {
   seriesTicker: string;
   side: 'bid' | 'ask';
   yesPrice: Decimal;
+  /** Ticks behind the touch at placement. Zero is the v0 join-the-BBO probe. */
+  ticksBehindAtEntry: number;
   priceCents: number;
   quantity: number;
   plannedDwellMs: number;
@@ -130,6 +164,15 @@ interface ActiveProbe {
   modelledQueueAtEntry: Map<string, Decimal>;
 }
 
+/** One resolved placement decision. */
+interface Placement {
+  chosen: Candidate;
+  side: 'bid' | 'ask';
+  yesPrice: Decimal;
+  ticksBehind: number;
+  book: import('@/src/research/engine/marketState').BookView;
+}
+
 /** Why the runner stopped placing orders. */
 export type StopReason =
   | 'book_invalid'
@@ -139,6 +182,7 @@ export type StopReason =
   | 'risk_limit'
   | 'ambiguous_order_state'
   | 'duration_elapsed'
+  | 'target_observations_reached'
   | 'interrupted';
 
 export class CalibrationRunner {
@@ -154,6 +198,9 @@ export class CalibrationRunner {
   private readonly active = new Map<string, ActiveProbe>();
   private readonly byOrderId = new Map<string, ActiveProbe>();
   private readonly sampledByStratum = new Map<string, number>();
+  private readonly sampledByCell = new Map<string, number>();
+  /** Nonzero queue changes observed while genuinely behind the touch. */
+  private informativeMoves = 0;
 
   private marketStates = new Map<string, HistoricalMarketState>();
   private readonly positions = new Map<string, Decimal>();
@@ -297,6 +344,10 @@ export class CalibrationRunner {
       await this.shutdown();
     }
 
+    logger.info(
+      { event: 'calibration_yield', informative_moves: this.informativeMoves },
+      `${this.informativeMoves} informative behind-touch queue move(s)`,
+    );
     const reason = this.halted ?? 'duration_elapsed';
     await this.store.endRun(this.runId, reason, this.haltDetail || null);
     return { runId: this.runId, stopReason: reason, detail: this.haltDetail };
@@ -511,26 +562,17 @@ export class CalibrationRunner {
       return;
     }
 
-    const chosen = selectNext(candidates, this.sampledByStratum, this.random, {
-      preferChurn: this.config.preferChurn,
-    });
-    if (!chosen) {
+    const behind = this.config.behindTouchTicks ?? [];
+    const placement =
+      behind.length > 0
+        ? this.selectBehindTouch(candidates, behind)
+        : this.selectAtTouch(candidates);
+
+    if (!placement) {
       this.nextProbeAtMs = now + 2_000;
       return;
     }
-
-    const side = chooseSide(this.random);
-    const book = this.state.view(chosen.marketTicker);
-    const bbo = book?.bbo();
-    if (!book?.valid || !bbo?.bid || !bbo.ask) {
-      this.nextProbeAtMs = now + 1_000;
-      return;
-    }
-
-    // Join the existing touch. Never penny: a one-tick improvement would put
-    // us at the front of an empty queue, which is the one position that
-    // teaches nothing about queueing.
-    const yesPrice = side === 'bid' ? bbo.bid : bbo.ask;
+    const { chosen, side, yesPrice, ticksBehind, book } = placement;
     const premium = premiumForProbe(yesPrice, side, this.config.envelope.orderSize);
 
     const decision = mayPlaceProbe(
@@ -554,7 +596,84 @@ export class CalibrationRunner {
       return;
     }
 
-    await this.launchProbe(chosen, side, yesPrice, premium, book);
+    await this.launchProbe(chosen, side, yesPrice, ticksBehind, premium, book);
+  }
+
+  /** v0 placement: join the existing touch. */
+  private selectAtTouch(candidates: readonly Candidate[]): Placement | null {
+    const chosen = selectNext(candidates, this.sampledByStratum, this.random, {
+      preferChurn: this.config.preferChurn,
+    });
+    if (!chosen) return null;
+    const side = chooseSide(this.random);
+    const book = this.state.view(chosen.marketTicker);
+    const bbo = book?.bbo();
+    if (!book?.valid || !bbo?.bid || !bbo.ask) return null;
+
+    // Never penny: a one-tick improvement would put us at the front of an
+    // empty queue, the one position that teaches nothing about queueing.
+    return { chosen, side, yesPrice: side === 'bid' ? bbo.bid : bbo.ask, ticksBehind: 0, book };
+  }
+
+  /**
+   * Behind-the-touch placement, over a balanced series x side x distance design.
+   *
+   * Every eligible (market, side, distance) combination is enumerated, the
+   * least-sampled DESIGN CELL is chosen, and a market is drawn from within it.
+   * Balancing the design rather than the market list is what keeps the answer
+   * from being about whichever contract happened to be quotable most often.
+   */
+  private selectBehindTouch(
+    candidates: readonly Candidate[],
+    ticksChoices: readonly number[],
+  ): Placement | null {
+    const options: (Placement & { cell: DesignCell })[] = [];
+
+    for (const candidate of candidates) {
+      const book = this.state.view(candidate.marketTicker);
+      const bbo = book?.valid ? book.bbo() : null;
+      if (!book || !bbo?.bid || !bbo.ask) continue;
+      const bestBid: Decimal = bbo.bid;
+      const bestAsk: Decimal = bbo.ask;
+
+      for (const side of ['bid', 'ask'] as const) {
+        for (const ticks of ticksChoices) {
+          const step = D(ticks).div(100);
+          const yesPrice: Decimal = side === 'bid' ? bestBid.minus(step) : bestAsk.plus(step);
+          if (yesPrice.lte(0) || yesPrice.gte(1)) continue;
+          // Must not cross: a behind-touch price never should, but a crossed
+          // or one-tick book can produce one, and post_only would reject it.
+          if (side === 'bid' && yesPrice.gte(bestAsk)) continue;
+          if (side === 'ask' && yesPrice.lte(bestBid)) continue;
+
+          if (this.config.requireRestingAtTarget !== false) {
+            const ahead = book.depthAhead(side, yesPrice);
+            // Somebody has to be ahead of us or there is no queue to observe.
+            if (ahead.sameLevel.lte(0)) continue;
+          }
+
+          options.push({
+            chosen: candidate,
+            side,
+            yesPrice,
+            ticksBehind: ticks,
+            book,
+            cell: { seriesTicker: candidate.seriesTicker, side, ticksBehind: ticks },
+          });
+        }
+      }
+    }
+
+    if (options.length === 0) return null;
+    const cell = selectLeastSampledCell(
+      options.map((o) => o.cell),
+      this.sampledByCell,
+      this.random,
+    );
+    if (!cell) return null;
+
+    const inCell = options.filter((o) => cellId(o.cell) === cellId(cell));
+    return inCell[Math.floor(this.random() * inCell.length)] ?? null;
   }
 
   private eligibleCandidates(nowMs: number): Candidate[] {
@@ -594,12 +713,13 @@ export class CalibrationRunner {
     candidate: Candidate,
     side: 'bid' | 'ask',
     yesPrice: Decimal,
+    ticksBehind: number,
     premium: Decimal,
     book: import('@/src/research/engine/marketState').BookView,
   ): Promise<void> {
     const probeId = randomUUID();
     const clientOrderId = `cal-${probeId.slice(0, 18)}`;
-    const dwellMs = chooseDwellMs(this.random);
+    const dwellMs = chooseDwellMs(this.random, this.config.dwellChoicesMs);
     const bbo = book.bbo();
 
     // A NO buy at 1-p is what a Kalshi offer physically is, so the probe is
@@ -667,11 +787,14 @@ export class CalibrationRunner {
       recordedInitialQueue: false,
       premium,
       stratum: stratumId(candidate.stratum),
+      ticksBehindAtEntry: ticksBehind,
       modelledQueueAtEntry: new Map(),
     };
     this.active.set(clientOrderId, probe);
     this.ordersToday += 1;
     this.sampledByStratum.set(probe.stratum, (this.sampledByStratum.get(probe.stratum) ?? 0) + 1);
+    const cell = cellId({ seriesTicker: candidate.seriesTicker, side, ticksBehind });
+    this.sampledByCell.set(cell, (this.sampledByCell.get(cell) ?? 0) + 1);
     await this.store.bumpRunCounters(this.runId, { attempted: 1 }).catch(() => {});
 
     if (this.config.dryRun) {
@@ -988,6 +1111,23 @@ export class CalibrationRunner {
             recvTsMs: result.timing.ackTs,
           })
           .catch(() => {});
+      }
+      // The stopping rule counts YIELD, not effort: a queue change observed
+      // while genuinely behind the touch. Everything else is cost.
+      if (
+        queuePosition !== null &&
+        probe.lastQueuePosition !== null &&
+        Math.abs(queuePosition - probe.lastQueuePosition) >= 1 &&
+        (ticks ?? 0) >= 1
+      ) {
+        this.informativeMoves += 1;
+        const target = this.config.targetInformativeMoves ?? 0;
+        if (target > 0 && this.informativeMoves >= target) {
+          this.halt(
+            'target_observations_reached',
+            `${this.informativeMoves} informative behind-touch queue moves collected`,
+          );
+        }
       }
       if (queuePosition !== null) probe.lastQueuePosition = queuePosition;
 

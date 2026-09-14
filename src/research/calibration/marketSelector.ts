@@ -18,6 +18,8 @@ import type { CalibrationEnvelope } from '@/src/research/calibration/riskEnvelop
  * trade when the output is a model rather than a profit.
  */
 
+import type { LadderSide } from '@/src/book/ladder';
+
 export type DepthStratum = 'low_depth' | 'high_depth';
 export type FlowStratum = 'low_flow' | 'high_flow';
 
@@ -188,8 +190,57 @@ export function selectNext(
 /** Dwell times, in milliseconds. Randomised so duration is not confounded. */
 export const DWELL_CHOICES_MS = [10_000, 30_000, 60_000, 120_000] as const;
 
-export function chooseDwellMs(random: () => number): number {
-  return DWELL_CHOICES_MS[Math.floor(random() * DWELL_CHOICES_MS.length)]!;
+/**
+ * Longer dwells for the behind-the-touch experiment.
+ *
+ * The whole point of resting behind the BBO is to be there while better-priced
+ * liquidity appears and disappears in front of us. A ten-second probe is
+ * unlikely to see that happen even once, so the short dwells are dropped.
+ */
+export const BEHIND_TOUCH_DWELL_MS = [60_000, 120_000] as const;
+
+export function chooseDwellMs(random: () => number, choices: readonly number[] = DWELL_CHOICES_MS): number {
+  return choices[Math.floor(random() * choices.length)]!;
+}
+
+/**
+ * A cell of the behind-the-touch design: series x side x distance.
+ *
+ * Eight cells, rotated to the least-sampled. Depth and flow strata are still
+ * recorded but no longer drive selection here: with a target of a few dozen
+ * probes, rotating over thirty-two cells would leave every one of them empty,
+ * and the factors that matter for this question are which side we are on and
+ * how far behind.
+ */
+export interface DesignCell {
+  seriesTicker: string;
+  side: LadderSide;
+  ticksBehind: number;
+}
+
+export function cellId(cell: DesignCell): string {
+  return `${cell.seriesTicker}/${cell.side}/${cell.ticksBehind}`;
+}
+
+/** Picks the least-sampled design cell present among the candidates. */
+export function selectLeastSampledCell(
+  cells: readonly DesignCell[],
+  sampled: ReadonlyMap<string, number>,
+  random: () => number,
+): DesignCell | null {
+  if (cells.length === 0) return null;
+  let best = Number.POSITIVE_INFINITY;
+  let pool: DesignCell[] = [];
+  for (const cell of cells) {
+    const n = sampled.get(cellId(cell)) ?? 0;
+    if (n < best) {
+      best = n;
+      pool = [cell];
+    } else if (n === best) {
+      pool.push(cell);
+    }
+  }
+  return pool[Math.floor(random() * pool.length)] ?? null;
 }
 
 /**

@@ -42,6 +42,15 @@ export const EXPLAINED_TOLERANCE = 1;
 
 export interface AuditOptions {
   runId?: string;
+  /**
+   * Lag applied before comparing the reported queue with the public book.
+   *
+   * The v0 audit measured this rather than assuming it: the endpoint is a
+   * lagged view, concentrated at 400-800 ms. Applying it is what makes the
+   * H0-versus-H1 comparison a test of the DEFINITION rather than a test of
+   * whether we aligned the clocks.
+   */
+  appliedLagMs?: number;
   /** How far back a queue reading may be describing. See the file comment. */
   lagSearchStartMs?: number;
   lagSearchEndMs?: number;
@@ -52,6 +61,8 @@ export const AUDIT_DEFAULTS = {
   lagSearchStartMs: -500,
   lagSearchEndMs: 2500,
   lagStepMs: 100,
+  /** Measured, not assumed: the v0 audit put the endpoint lag at 400-800 ms. */
+  appliedLagMs: 500,
 };
 
 interface ProbeRow {
@@ -104,6 +115,11 @@ export interface Transition {
   executedAhead: number;
   ticksT0: number | null;
   ticksT1: number | null;
+  /** Reported queue against each hypothesis, on the lag-adjusted book. */
+  h0PredictedLevel: number;
+  h1PredictedLevel: number;
+  h0PredictedDelta: number;
+  h1PredictedDelta: number;
   atBboT0: boolean;
   atBboT1: boolean;
   betterAppeared: boolean;
@@ -145,6 +161,63 @@ export interface AuditResult {
   probesAudited: number;
   probesSkipped: { probeId: string; reason: string }[];
   rows: Transition[];
+  /** H0 against H1, on the lag-adjusted book. See HypothesisComparison. */
+  hypotheses: HypothesisComparison[];
+  /** Transitions by how far behind the touch the probe was sitting. */
+  byRegime: RegimeBreakdown[];
+  appliedLagMs: number;
+}
+
+/**
+ * Two explicit readings of what the exchange reports, compared on the same
+ * observations.
+ *
+ *   H0   queue position is the same-price FIFO queue
+ *   H1   queue position is everything ahead under price priority, so
+ *        better-priced depth counts too
+ *
+ * Deliberately NOT a fitted model. Two named hypotheses, compared on error and
+ * correlation, so the answer is "which reading of the endpoint is right"
+ * rather than "which parameters minimise a residual". A flexible model would
+ * fit either way and tell us nothing about the definition.
+ */
+export interface HypothesisComparison {
+  hypothesis: 'H0_same_price' | 'H1_price_priority';
+  observations: number;
+  /** Mean absolute error in contracts, against the reported queue. */
+  levelMae: number | null;
+  /**
+   * Signed mean error: reported minus predicted.
+   *
+   * MAE says how wrong, this says which way. A hypothesis that overshoots is
+   * counting something the exchange does not, which is the specific claim H1
+   * makes about better-priced depth.
+   */
+  levelBias: number | null;
+  correlation: number | null;
+  /** Share of nonzero moves the hypothesis predicts within tolerance. */
+  explainedMoveRate: number | null;
+  moves: number;
+  /** MAE of the predicted CHANGE, which is what a fill model consumes. */
+  deltaMae: number | null;
+}
+
+export interface RegimeBreakdown {
+  regime: 'AT_TOUCH' | '1_TICK_BEHIND' | '2_TICKS_BEHIND' | 'DEEPER';
+  transitions: number;
+  moves: number;
+  unexplained: number;
+  betterDepthUnchanged: number;
+  betterDepthIncreased: number;
+  betterDepthDecreased: number;
+  sameLevelTrade: number;
+  sameLevelRemoval: number;
+  sameLevelAddition: number;
+  sameLevelUnchanged: number;
+  h0Mae: number | null;
+  h1Mae: number | null;
+  h0Bias: number | null;
+  h1Bias: number | null;
 }
 
 /**
@@ -301,6 +374,7 @@ export async function auditQueueSemantics(
   const lagStart = opts.lagSearchStartMs ?? AUDIT_DEFAULTS.lagSearchStartMs;
   const lagEnd = opts.lagSearchEndMs ?? AUDIT_DEFAULTS.lagSearchEndMs;
   const lagStep = opts.lagStepMs ?? AUDIT_DEFAULTS.lagStepMs;
+  const appliedLag = opts.appliedLagMs ?? AUDIT_DEFAULTS.appliedLagMs;
 
   const scope = opts.runId ? sql`AND p.run_id = ${opts.runId}` : sql``;
   const probes = (await sql`
@@ -399,6 +473,17 @@ export async function auditQueueSemantics(
       const d1 = depthAt(points, t1);
       if (!d0 || !d1) continue;
 
+      // The hypothesis comparison uses the LAG-ADJUSTED book, because the v0
+      // audit established that the endpoint reports a past state. Comparing
+      // against the book at poll time would test our clock alignment rather
+      // than the definition of the number.
+      const a0 = depthAt(points, t0 - appliedLag) ?? d0;
+      const a1 = depthAt(points, t1 - appliedLag) ?? d1;
+      const h0Level = a1.same.toNumber();
+      const h1Level = a1.better.plus(a1.same).toNumber();
+      const h0Delta = a0.same.minus(a1.same).toNumber();
+      const h1Delta = a0.better.plus(a0.same).minus(a1.better.plus(a1.same)).toNumber();
+
       // Correlation is over every reading, not just the moving ones.
       reportedQ.push(q1);
       totalAhead.push(d1.better.plus(d1.same).toNumber());
@@ -470,6 +555,10 @@ export async function auditQueueSemantics(
         executedAhead,
         ticksT0: ticksFromTouch(side, yesPrice, d0.bestBid, d0.bestAsk),
         ticksT1: ticksFromTouch(side, yesPrice, d1.bestBid, d1.bestAsk),
+        h0PredictedLevel: h0Level,
+        h1PredictedLevel: h1Level,
+        h0PredictedDelta: h0Delta,
+        h1PredictedDelta: h1Delta,
         atBboT0: ticksFromTouch(side, yesPrice, d0.bestBid, d0.bestAsk) === 0,
         atBboT1: ticksFromTouch(side, yesPrice, d1.bestBid, d1.bestAsk) === 0,
         betterAppeared: d1.better.gt(d0.better),
@@ -508,6 +597,84 @@ export async function auditQueueSemantics(
     };
   };
 
+  const mae = (xs: readonly number[]) =>
+    xs.length === 0 ? null : xs.reduce((a, b) => a + Math.abs(b), 0) / xs.length;
+
+  const compare = (
+    hypothesis: HypothesisComparison['hypothesis'],
+    level: (r: Transition) => number,
+    delta: (r: Transition) => number,
+    subset: readonly Transition[] = rows,
+  ): HypothesisComparison => {
+    const movingSubset = subset.filter((r) => Math.abs(r.deltaQ) >= EXPLAINED_TOLERANCE);
+    return {
+      hypothesis,
+      observations: subset.length,
+      levelMae: mae(subset.map((r) => r.q1 - level(r))),
+      levelBias:
+        subset.length === 0
+          ? null
+          : subset.reduce((a, r) => a + (r.q1 - level(r)), 0) / subset.length,
+      correlation: pearson(subset.map((r) => r.q1), subset.map(level)),
+      moves: movingSubset.length,
+      explainedMoveRate:
+        movingSubset.length === 0
+          ? null
+          : movingSubset.filter((r) => Math.abs(r.deltaQ - delta(r)) < EXPLAINED_TOLERANCE).length /
+            movingSubset.length,
+      deltaMae: mae(movingSubset.map((r) => r.deltaQ - delta(r))),
+    };
+  };
+
+  const hypotheses = [
+    compare('H0_same_price', (r) => r.h0PredictedLevel, (r) => r.h0PredictedDelta),
+    compare('H1_price_priority', (r) => r.h1PredictedLevel, (r) => r.h1PredictedDelta),
+  ];
+
+  const regimeOf = (r: Transition): RegimeBreakdown['regime'] => {
+    const t = r.ticksT0 ?? 0;
+    if (t <= 0) return 'AT_TOUCH';
+    if (t === 1) return '1_TICK_BEHIND';
+    if (t === 2) return '2_TICKS_BEHIND';
+    return 'DEEPER';
+  };
+
+  const byRegime: RegimeBreakdown[] = (
+    ['AT_TOUCH', '1_TICK_BEHIND', '2_TICKS_BEHIND', 'DEEPER'] as const
+  )
+    .map((regime) => {
+      const inRegime = rows.filter((r) => regimeOf(r) === regime);
+      const movingHere = inRegime.filter((r) => Math.abs(r.deltaQ) >= EXPLAINED_TOLERANCE);
+      return {
+        regime,
+        transitions: inRegime.length,
+        moves: movingHere.length,
+        unexplained: movingHere.filter((r) => r.classification === 'STILL_UNEXPLAINED').length,
+        betterDepthUnchanged: movingHere.filter((r) => Math.abs(r.deltaBetter) < EXPLAINED_TOLERANCE)
+          .length,
+        betterDepthIncreased: movingHere.filter((r) => r.deltaBetter <= -EXPLAINED_TOLERANCE).length,
+        betterDepthDecreased: movingHere.filter((r) => r.deltaBetter >= EXPLAINED_TOLERANCE).length,
+        sameLevelTrade: movingHere.filter((r) => r.executedAhead >= EXPLAINED_TOLERANCE).length,
+        sameLevelRemoval: movingHere.filter(
+          (r) => r.executedAhead < EXPLAINED_TOLERANCE && r.deltaSame >= EXPLAINED_TOLERANCE,
+        ).length,
+        sameLevelAddition: movingHere.filter((r) => r.deltaSame <= -EXPLAINED_TOLERANCE).length,
+        sameLevelUnchanged: movingHere.filter((r) => Math.abs(r.deltaSame) < EXPLAINED_TOLERANCE)
+          .length,
+        h0Mae: mae(inRegime.map((r) => r.q1 - r.h0PredictedLevel)),
+        h1Mae: mae(inRegime.map((r) => r.q1 - r.h1PredictedLevel)),
+        h0Bias:
+          inRegime.length === 0
+            ? null
+            : inRegime.reduce((a, r) => a + (r.q1 - r.h0PredictedLevel), 0) / inRegime.length,
+        h1Bias:
+          inRegime.length === 0
+            ? null
+            : inRegime.reduce((a, r) => a + (r.q1 - r.h1PredictedLevel), 0) / inRegime.length,
+      };
+    })
+    .filter((r) => r.transitions > 0);
+
   const sortedLags = [...lagSamples].sort((a, b) => a - b);
   const histogram = new Map<number, number>();
   for (const l of sortedLags) histogram.set(l, (histogram.get(l) ?? 0) + 1);
@@ -542,5 +709,8 @@ export async function auditQueueSemantics(
     probesAudited: audited,
     probesSkipped: skipped,
     rows,
+    hypotheses,
+    byRegime,
+    appliedLagMs: appliedLag,
   };
 }

@@ -13,6 +13,7 @@ import {
   type CalibrationConfig,
 } from '@/src/research/calibration/calibrationRunner';
 import { CALIBRATION_V0 } from '@/src/research/calibration/riskEnvelope';
+import { BEHIND_TOUCH_DWELL_MS } from '@/src/research/calibration/marketSelector';
 import { makeFillModel } from '@/src/research/registry';
 import {
   censoring,
@@ -304,6 +305,16 @@ async function run(args: Args): Promise<void> {
     expirationSlackMs: CALIBRATION_DEFAULTS.expirationSlackMs,
     dryRun,
     preferChurn: args.bools.has('prefer-churn'),
+    // The behind-the-touch experiment. Everything about the safety envelope is
+    // unchanged; only the price changes.
+    behindTouchTicks: args.bools.has('behind-touch')
+      ? (args.flags.get('ticks')?.split(',').map(Number) ?? [1, 2])
+      : undefined,
+    dwellChoicesMs: args.bools.has('behind-touch') ? BEHIND_TOUCH_DWELL_MS : undefined,
+    requireRestingAtTarget: true,
+    targetInformativeMoves: args.flags.has('target-moves')
+      ? Number(args.flags.get('target-moves'))
+      : undefined,
     // Every historical fill model, evaluated on the same real orders. This is
     // the comparison the whole experiment exists to make possible.
     fillModels: ['touch', 'conservative_queue', 'queue_decay'].map((n) => makeFillModel(n)),
@@ -322,11 +333,25 @@ async function run(args: Args): Promise<void> {
   console.log(`  resting     max ${config.envelope.maxRestingOrders} total, ${config.envelope.maxRestingPerMarket} per market`);
   console.log(`  exposure    max $${config.envelope.maxWorstCaseExposureUsd} worst case`);
   console.log(`  queue poll  every ${config.queuePollIntervalMs}ms, bulk endpoint`);
-  if (config.preferChurn) {
-    console.log('  selection   stratum rotation, ties broken toward a moving touch\n');
-  } else {
-    console.log('');
+  if (config.behindTouchTicks?.length) {
+    console.log(
+      `  placement   BEHIND the touch by ${config.behindTouchTicks.join(' or ')} tick(s), ` +
+        'balanced over series x side x distance',
+    );
+    console.log(
+      `  dwell       ${(config.dwellChoicesMs ?? []).map((d) => d / 1000).join('/')}s  ` +
+        '(long, so better-priced liquidity has time to move)',
+    );
+    console.log('  target      levels that already have resting size');
+  } else if (config.preferChurn) {
+    console.log('  selection   stratum rotation, ties broken toward a moving touch');
   }
+  if (config.targetInformativeMoves) {
+    console.log(
+      `  stop        after ${config.targetInformativeMoves} informative behind-touch queue moves`,
+    );
+  }
+  console.log('');
 
   const stop = () => {
     logger.warn({ event: 'calibration_interrupt' }, 'interrupt received; cancelling probes');
@@ -468,7 +493,10 @@ async function analyze(args: Args): Promise<void> {
 async function queueAudit(args: Args): Promise<void> {
   const sql = db();
   try {
-    const out = await auditQueueSemantics(sql, { runId: args.flags.get('run') });
+    const out = await auditQueueSemantics(sql, {
+      runId: args.flags.get('run'),
+      appliedLagMs: args.flags.has('lag-ms') ? Number(args.flags.get('lag-ms')) : undefined,
+    });
     const pad = (v: unknown, n: number) => String(v).padStart(n);
     const pct = (n: number, d: number) => (d === 0 ? '   -' : `${((n / d) * 100).toFixed(0)}%`.padStart(4));
 
@@ -526,6 +554,48 @@ async function queueAudit(args: Args): Promise<void> {
       `  mean(reported Q - better depth)   ${out.meanResidualSameLevel?.toFixed(2) ?? '-'}   <- should look like a same-level queue`,
     );
 
+    const f = (v: number | null, dp = 2) => (v === null ? '   -' : v.toFixed(dp).padStart(8));
+    console.log(`\n  --- H0 vs H1, on the book shifted back ${out.appliedLagMs}ms ---\n`);
+    console.log(
+      `  ${'hypothesis'.padEnd(22)}${'level MAE'.padStart(10)}${'bias'.padStart(9)}` +
+        `${'corr'.padStart(9)}${'dMAE'.padStart(9)}${'moves ok'.padStart(10)}`,
+    );
+    for (const h of out.hypotheses) {
+      const label = h.hypothesis === 'H0_same_price' ? 'H0 same-price FIFO' : 'H1 price priority';
+      console.log(
+        `  ${label.padEnd(22)}${f(h.levelMae)}${f(h.levelBias)} ${f(h.correlation, 3)}${f(h.deltaMae)}` +
+          `${(h.explainedMoveRate === null ? '   -' : `${(h.explainedMoveRate * 100).toFixed(0)}%`).padStart(10)}`,
+      );
+    }
+    console.log(
+      '\n  Lower MAE and higher correlation win. If adding better-priced depth does not',
+    );
+    console.log(
+      '  help BEHIND the touch, the endpoint is same-price FIFO and beta belongs at zero.',
+    );
+
+    console.log('\n  --- by regime ---\n');
+    console.log(
+      `  ${'regime'.padEnd(16)}${'obs'.padStart(7)}${'moves'.padStart(7)}${'unexp'.padStart(7)}` +
+        `${'H0 MAE'.padStart(9)}${'H0 bias'.padStart(9)}${'H1 MAE'.padStart(9)}${'H1 bias'.padStart(9)}`,
+    );
+    for (const r of out.byRegime) {
+      console.log(
+        `  ${r.regime.padEnd(16)}${String(r.transitions).padStart(7)}${String(r.moves).padStart(7)}` +
+          `${String(r.unexplained).padStart(7)}${f(r.h0Mae)}${f(r.h0Bias)}${f(r.h1Mae)}${f(r.h1Bias)}`,
+      );
+    }
+    console.log('\n  moves by what the book did, per regime');
+    for (const r of out.byRegime) {
+      if (r.moves === 0) continue;
+      console.log(
+        `    ${r.regime.padEnd(16)} better: ${r.betterDepthUnchanged} unchanged / ` +
+          `${r.betterDepthIncreased} up / ${r.betterDepthDecreased} down    ` +
+          `same: ${r.sameLevelTrade} trade / ${r.sameLevelRemoval} removal / ` +
+          `${r.sameLevelAddition} addition / ${r.sameLevelUnchanged} unchanged`,
+      );
+    }
+
     for (const s of out.splits) {
       console.log(`\n  by ${s.dimension}`);
       for (const b of s.buckets) {
@@ -578,6 +648,9 @@ async function main(): Promise<void> {
             '  --dry-run                                    full loop, no orders sent',
             '  --i-understand-this-places-real-orders       required for a live run',
             '  --minutes N        --series A,B              --queue-poll-ms N',
+            '  --behind-touch     rest 1-2 ticks behind the BBO instead of joining it',
+            '  --ticks 1,2        distances to use with --behind-touch',
+            '  --target-moves N   stop after N informative behind-touch queue moves',
           ].join('\n'),
         );
     }
