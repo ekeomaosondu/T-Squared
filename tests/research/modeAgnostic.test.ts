@@ -87,13 +87,20 @@ describe('the simulation is deterministic by construction', () => {
     path.join(ROOT, 'engine', 'runBacktest.ts'),
     path.join(ROOT, 'results', 'runManifest.ts'),
     path.join(ROOT, 'results', 'resultWriter.ts'),
-    // The LIVE feed. Wall time is not a defect here, it is the input: a
-    // shadow run's clock is the socket's arrival times and its stop condition
-    // is a real duration. The rule this test enforces is about the SIMULATED
-    // path, and a live adapter is by definition not on it. The exemption is
-    // one file wide, and everything downstream of it -- engine, strategies,
-    // fill models, metrics -- stays under the rule.
+    // LIVE adapters. Wall time is not a defect in these, it is the input: a
+    // shadow run's clock is the socket's arrival times, a calibration probe's
+    // dwell is a real duration, and the queue poller is a real 500 ms timer.
+    // The rule this test enforces is about the SIMULATED path, and a live
+    // adapter is by definition not on it.
+    //
+    // The exemption is per-FILE and each one is named. Everything downstream
+    // of them -- engine, strategies, fill models, metrics -- and every piece
+    // of pure calibration logic (the risk envelope, the market selector, the
+    // level tracker) stays under the rule, which is what keeps a live run's
+    // decisions reproducible from its recorded inputs.
     path.join(ROOT, 'data', 'liveKalshiSource.ts'),
+    path.join(ROOT, 'calibration', 'calibrationRunner.ts'),
+    path.join(ROOT, 'calibration', 'privateFeed.ts'),
   ]);
 
   it('never reads wall time or randomness in the simulated path', () => {
