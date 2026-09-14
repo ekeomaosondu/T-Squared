@@ -11,6 +11,11 @@ downsampled, interpolated, smoothed, deduplicated or repaired on the way in.
 Sampling horizons apply only to *derived* tables, all of which can be
 recomputed from raw history.
 
+The strategy research platform that reads this data lives in
+[RESEARCH.md](RESEARCH.md). It replays the recorded book, checks its
+reconstruction against the collector's own hashes, and runs strategies through
+an execution simulator that cannot see the future.
+
 ---
 
 ## Status
@@ -779,6 +784,8 @@ fabricated and each session is a separately auditable epoch.
 | P4 | Export CLI | not started |
 | P3 | Vercel rolling workers, session leases, handoff | deferred, see below |
 | P5 | Private order/fill streams, weather reference feeds | scaffolded (schema + interface only) |
+| R1 | Research platform: replay, strategy interface, execution simulator, benchmarks, metrics | done, see [RESEARCH.md](RESEARCH.md) |
+| R2 | Live/shadow/paper adapters, queue-model calibration from real fills | not started |
 
 Replay (nominally P4) was built early because it is the acceptance test for
 everything below it.
