@@ -31,7 +31,8 @@
     "archive:smoke": "tsx scripts/archiveSmoke.ts",
     "cutover": "tsx scripts/cutover.ts",
     "deploy:check": "tsx scripts/deployCheck.ts",
-    "deploy:fly": "bash scripts/deployFly.sh"
+    "deploy:fly": "bash scripts/deployFly.sh",
+    "research": "tsx scripts/research.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1131.0",

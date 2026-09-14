@@ -1,0 +1,60 @@
+# Phase 1 acceptance matrix.
+#
+# Three deliberately simple strategies, two fill models that bracket the queue
+# uncertainty, four latency assumptions. 3 x 2 x 4 = 24 comparable runs over
+# one dataset slice, one fingerprint, one book verification.
+#
+#   npm run research -- compare --config experiments/baseline.yaml
+#
+# The question this answers is NOT "how much money would we have made". It is:
+# which strategy fills more, which captures more spread, which is picked off
+# harder, and how much of the answer survives changing the fill model and the
+# latency. If a conclusion flips between `touch` and `conservative_queue`, the
+# conclusion is about the queue assumption and not about the strategy.
+
+dataset: kalshi-prod-2026-09
+
+period:
+  from: 2026-09-13
+  to: 2026-09-14
+
+series:
+  - KXHIGHNY
+  - KXHIGHLAX
+
+strategies:
+  - join-bbo
+  - imbalance-maker
+  - inventory-skew-maker
+
+# Per-strategy overrides. Everything here lands in the run manifest.
+strategyParams:
+  join-bbo:
+    size: '10'
+    maxInventory: '50'
+    minSpreadCents: 2
+  imbalance-maker:
+    size: '10'
+    maxInventory: '50'
+    minSpreadCents: 2
+    k: 3
+    threshold: '0.2'
+    policy: quote_favoured
+  inventory-skew-maker:
+    size: '10'
+    maxInventory: '50'
+    minSpreadCents: 2
+    maxSkewCents: 2
+    symmetric: true
+
+fillModels:
+  - touch
+  - conservative_queue
+
+latencyMs:
+  - 0
+  - 50
+  - 100
+  - 250
+
+feeModel: kalshi
