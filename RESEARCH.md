@@ -1,4 +1,4 @@
-# Kalshi HFT research platform — Phase 1
+# Kalshi HFT research platform
 
 A strategy lab that reads the same R2 lake the recorder writes, replays the
 exact order book the collector saw, runs a strategy against it, simulates
@@ -35,6 +35,53 @@ Phase 2 replaces one box:
 ```
 Kalshi live feed -> same Strategy -> LiveExecutionAdapter
 ```
+
+---
+
+## Execution modes
+
+```
+BACKTEST     recorded data, simulated execution
+SHADOW       LIVE data, no real orders, hypothetical execution recorded
+CALIBRATION  live data, REAL orders at tiny fixed size, placed to learn
+             execution mechanics rather than to make money
+LIVE         real strategy, real risk, a PnL objective
+```
+
+There is deliberately no "paper" mode. Paper implies simulated execution, and
+CALIBRATION is the opposite: it places real orders precisely because simulated
+execution is the quantity being estimated.
+
+**Shadow cannot calibrate queue position.** If an order is never on the
+exchange, the exchange cannot say where in the FIFO it would have been. Shadow
+validates timing, signal behaviour and how sensitive hypothetical fills are to
+the queue assumption; the assumption itself needs real resting orders.
+
+```bash
+npm run shadow -- --strategy join-bbo --series KXHIGHNY --minutes 30 --latency-ms 100
+```
+
+Writes `research/shadow/<run_id>/` with a manifest, every hypothetical order
+(decision book, arrival book, displayed size at its level, both timestamps) and
+one fills file per queue assumption. The live source opens a **read-only**
+subscription: no session row, no raw frames, nothing to the recorded dataset.
+
+---
+
+## Counterfactual queue assumptions
+
+Live data does not come twice, so several fill models have to run in one pass:
+
+```bash
+npm run research -- backtest --strategy join-bbo --from 2026-09-13 --to 2026-09-14 \
+  --fill-model conservative_queue --counterfactual-fills touch,queue_decay
+```
+
+Each counterfactual gets its own exchange and portfolio, sees the same events
+and the same intents, and **never calls the strategy back** — a strategy whose
+inventory follows several execution realities at once does not have an
+inventory. Orders are therefore identical by construction and any difference is
+the queue model alone.
 
 ---
 
@@ -257,6 +304,60 @@ horizon instead of being silently dropped.
 
 ---
 
+## Settlement
+
+A binary contract does not end at the last mid. It ends at exactly $0 or $1,
+decided by an authority outside the order book.
+
+```
+OPEN                  still trading
+CLOSED_UNDETERMINED   trading over, the exchange has not ruled
+DETERMINED_YES        pays the notional
+DETERMINED_NO         pays nothing
+VOIDED                cancelled; the position returns at cost
+```
+
+`VOIDED` is a fifth state beyond the four the specification named. Kalshi
+cancels markets, and folding that into either determination books a payout that
+never happened.
+
+Market definitions, determinations and fee treatment export as **dated
+snapshots** (`npm run silver -- --market-state`), not partitioned by trading
+day. A daily temperature market closes in the small hours and is determined
+from the following morning's climate report, so the fact that settles Monday's
+book does not exist until Tuesday; research reads the most recent snapshot.
+
+**Nothing is inferred from weather data.** The exchange's own record is the only
+authority — preliminary observations and the final climate report disagree
+often enough that settling from the former would measure a different market.
+
+Every run reports PnL decomposed, because the parts answer different questions:
+
+```
+trading (round trip)   was the market making any good?
+settlement             did the inventory we were left holding happen to be right?
+open, marked at mid    a mark, not a result
+gross / fees / total economic
+```
+
+A maker that loses on spread and is rescued by a lucky determination has not
+found an edge, and one net figure cannot say so.
+
+The four ways a position can fail to settle are kept apart, because they are
+not the same problem:
+
+| resolution | meaning | fixable by |
+|---|---|---|
+| `OPEN_AT_RUN_END` | the window we chose ended while it was trading | extending the run |
+| `AWAITING_DETERMINATION` | trading is over, the exchange has not ruled | waiting, then re-snapshotting |
+| `noMarketState` | no record in the lake | `npm run silver -- --market-state` |
+| `UNPRICEABLE` | no determination and no mark | nothing |
+
+A determination is read only by post-run accounting, from a map no strategy
+holds a reference to. Settlement runs after `onStop`.
+
+---
+
 ## Accounting
 
 One signed position in YES contracts per market. Kalshi's two instruments are
@@ -282,12 +383,40 @@ run; pricing it at a guess would be worse.
 events. Open positions are marked at the last mid and the summary says so
 loudly. A large residual inventory means the net PnL is substantially a mark.
 
-Fees follow Kalshi's quadratic form, `ceil_to_cents(rate × C × P × (1−P))`,
-which peaks at 50c and vanishes in the tails. A flat basis-point model gets the
-sign of that effect wrong and would send a study looking for edge in the wrong
-strikes. **The rate and the maker fee are defaults, not measurements** — both are
-recorded in every manifest and must be checked against the current per-series
-schedule before any absolute PnL is quoted.
+## Fees
+
+Kalshi's fee is quadratic in price, `ceil_to_cents(rate × multiplier × C × P ×
+(1−P))`, peaking at 50c and vanishing in the tails. A flat basis-point model
+gets the sign of that effect wrong and would send a study looking for edge in
+the wrong strikes.
+
+The API supplies **`fee_type` and `fee_multiplier` per series**, and the
+recorder captures both with the timestamp of the metadata that carried them.
+Those are facts. It does **not** supply the coefficient, and Kalshi's own
+documentation says some markets charge maker fees and some do not.
+
+So the coefficient and the maker fee live in `config/feeSchedule.json`, where a
+human asserts them with a source, a date and a `verified` flag:
+
+```jsonc
+{ "feeType": "quadratic", "baseRate": "0.07", "makerFeePerContract": "0",
+  "source": "https://kalshi.com/docs/kalshi-fee-schedule.pdf",
+  "verified": false, "verifiedBy": null, "verifiedAt": null }
+```
+
+**While `verified` is false — as it is today — a fee is UNKNOWN, not zero.** The
+unknown propagates: `feeVerified: false` and net PnL withheld as N/A. An
+unverified assumption quietly applied produces a number that looks like a result
+and someone will quote it. A canary test asserts the shipped schedule is still
+unverified, so flipping it is a deliberate act.
+
+Entries are selected by the time of the fill, so a schedule change is a new
+entry rather than an edit and re-running an old backtest keeps charging the old
+rate.
+
+**Market-maker programme rebates are separate and default to absent.** A rebate
+is a property of the participant, not of the market; reporting ordinary-member
+and market-maker economics as one figure overstates the second.
 
 ---
 
@@ -367,10 +496,23 @@ be disabled with `--no-verify` once a day has been verified.
 
 ---
 
-## Explicit non-goals for Phase 1
+## What is not built yet
 
-No dashboard, no distributed compute, no parameter optimizer, no ML framework,
-no ClickHouse, no Kafka, no Ray, no Spark, no Iceberg, no calibrated queue
-model, no Avellaneda-Stoikov, no weather model, no automatic deployment.
+CALIBRATION mode places **real orders** and is therefore not something to switch
+on unilaterally. The scaffolding it needs — execution modes, the shadow record,
+decision/arrival book capture, counterfactual fill models — is in place; what
+remains is order placement against the private API, private order/fill
+recording, and the queue-position observations that make the calibration
+dataset. Those wait on an explicit decision to risk capital.
 
-Establish that simple strategies produce sensible relative results first.
+Downstream of calibration, and blocked on it:
+
+- an empirical latency dataset (`t_ack − t_send`, p50/p90/p95/p99 by operation)
+  to replace the fixed 0/50/100/250 ms sweep
+- fitting `α` in `Q(t+Δ) = Q(t) − V_executed − α·C(t)` against observed queue
+  positions, replacing the arbitrary `queue_decay` parameters
+- re-running the benchmark matrix under the calibrated model
+
+Still not built, deliberately: dashboard, distributed compute, parameter
+optimizer, ML framework, ClickHouse, Kafka, Ray, Spark, Iceberg,
+Avellaneda-Stoikov, weather model, automatic deployment.
