@@ -60,6 +60,16 @@ export interface SimulatedOrder extends Omit<WorkingOrder, 'status'> {
   status: OrderStatus;
   filledQuantity: Decimal;
 
+  /**
+   * Submission counter, used as the final tiebreak wherever orders are
+   * ordered.
+   *
+   * A NUMBER, not the string id. Sorting on "o10" versus "o2" is
+   * lexicographic and puts the tenth order before the second -- the same class
+   * of bug that once made this dataset's deltas replay out of order.
+   */
+  sequence: number;
+
   /** When the strategy emitted the intent. */
   submittedAtMs: bigint;
   /** When it reaches the exchange. Nothing happens before this. */
@@ -144,8 +154,19 @@ export class SimulatedExchange {
   private readonly byClientId = new Map<string, string>();
   /** Orders awaiting their effective time, in submission order. */
   private pending: SimulatedOrder[] = [];
+  /** Cancels awaiting their effective time, in request order. */
+  private pendingCancels: SimulatedOrder[] = [];
   /** Resting orders indexed by the exact book level they sit on. */
   private readonly restingByLevel = new Map<string, Set<string>>();
+  /**
+   * Resting orders indexed by market.
+   *
+   * Both indexes exist for one reason: a run accumulates tens of thousands of
+   * orders, and scanning all of them on every trade -- or every event -- is
+   * quadratic in a dataset with a million of them. On a full trading day that
+   * is the difference between minutes and hours.
+   */
+  private readonly restingByMarket = new Map<string, Set<string>>();
   /** Markets frozen by an open capture gap. */
   private readonly frozen = new Set<string>();
 
@@ -223,8 +244,10 @@ export class SimulatedExchange {
     }
 
     const yesPrice = yesEquivalentPrice(intent.side, intent.action, price);
+    const sequence = ++this.orderSeq;
     const order: SimulatedOrder = {
-      orderId: `o${++this.orderSeq}`,
+      orderId: `o${sequence}`,
+      sequence,
       clientOrderId: intent.clientOrderId,
       marketTicker: intent.marketTicker,
       side: intent.side,
@@ -274,6 +297,7 @@ export class SimulatedExchange {
       nowMs +
       BigInt(Math.round(this.latency.decisionLatencyMs())) +
       BigInt(Math.round(this.latency.cancelLatencyMs(order)));
+    this.pendingCancels.push(order);
 
     return [this.update(order, 'cancel_requested', nowMs)];
   }
@@ -293,14 +317,24 @@ export class SimulatedExchange {
     const updates: SimulatedOrderUpdate[] = [];
     const fills: SimulatedFill[] = [];
 
-    for (const order of this.orders.values()) {
-      if (order.cancelEffectiveAtMs === null) continue;
-      if (order.cancelEffectiveAtMs > nowMs) continue;
-      if (order.status === 'filled' || order.status === 'cancelled' || order.status === 'rejected') {
-        continue;
+    if (this.pendingCancels.length > 0) {
+      const stillPendingCancel: SimulatedOrder[] = [];
+      for (const order of this.pendingCancels) {
+        if (order.cancelEffectiveAtMs !== null && order.cancelEffectiveAtMs > nowMs) {
+          stillPendingCancel.push(order);
+          continue;
+        }
+        if (
+          order.status === 'filled' ||
+          order.status === 'cancelled' ||
+          order.status === 'rejected'
+        ) {
+          continue;
+        }
+        this.retire(order, 'cancelled', 'cancel effective', nowMs);
+        updates.push(this.update(order, 'cancelled', nowMs));
       }
-      this.retire(order, 'cancelled', 'cancel effective', nowMs);
-      updates.push(this.update(order, 'cancelled', nowMs));
+      this.pendingCancels = stillPendingCancel;
     }
 
     if (this.pending.length === 0) return { updates, fills };
@@ -413,6 +447,13 @@ export class SimulatedExchange {
       this.restingByLevel.set(key, set);
     }
     set.add(order.orderId);
+
+    let byMarket = this.restingByMarket.get(order.marketTicker);
+    if (!byMarket) {
+      byMarket = new Set();
+      this.restingByMarket.set(order.marketTicker, byMarket);
+    }
+    byMarket.add(order.orderId);
   }
 
   private levelKey(marketTicker: string, side: 'yes' | 'no', price: string): string {
@@ -471,21 +512,21 @@ export class SimulatedExchange {
     // Remaining print size, shared across our orders at successive prices.
     let available = tradeQty;
 
-    const candidates = [...this.orders.values()]
-      .filter(
-        (o) =>
-          o.status === 'resting' &&
-          o.marketTicker === event.marketTicker &&
-          o.yesAction === eligibleAction,
-      )
+    const restingHere = this.restingByMarket.get(event.marketTicker);
+    if (!restingHere || restingHere.size === 0) return fills;
+
+    const candidates = [...restingHere]
+      .map((id) => this.orders.get(id)!)
+      .filter((o) => o !== undefined && o.status === 'resting' && o.yesAction === eligibleAction)
       .filter((o) =>
         eligibleAction === 'buy' ? o.yesPrice.gte(tradeYesPrice) : o.yesPrice.lte(tradeYesPrice),
       )
       // Best price first: a more aggressive resting order is reached first.
+      // Best price first, then price-time priority among equals.
       .sort((a, b) =>
         eligibleAction === 'buy'
-          ? b.yesPrice.comparedTo(a.yesPrice) || (a.orderId < b.orderId ? -1 : 1)
-          : a.yesPrice.comparedTo(b.yesPrice) || (a.orderId < b.orderId ? -1 : 1),
+          ? b.yesPrice.comparedTo(a.yesPrice) || a.sequence - b.sequence
+          : a.yesPrice.comparedTo(b.yesPrice) || a.sequence - b.sequence,
       );
 
     for (const order of candidates) {
@@ -641,6 +682,7 @@ export class SimulatedExchange {
     this.restingByLevel
       .get(this.levelKey(order.marketTicker, ladder.side, ladder.price))
       ?.delete(order.orderId);
+    this.restingByMarket.get(order.marketTicker)?.delete(order.orderId);
   }
 
   private reject(clientOrderId: string, reason: string, atMs: bigint): SimulatedOrderUpdate {
@@ -673,26 +715,39 @@ export class SimulatedExchange {
   }
 
   allOrders(): SimulatedOrder[] {
-    return [...this.orders.values()];
+    return [...this.orders.values()].sort((a, b) => a.sequence - b.sequence);
   }
 
   openOrders(marketTicker?: string): SimulatedOrder[] {
-    return this.allOrders().filter(
-      (o) =>
-        (o.status === 'resting' || o.status === 'pending') &&
-        (marketTicker === undefined || o.marketTicker === marketTicker),
-    );
+    const out: SimulatedOrder[] = [];
+
+    const markets =
+      marketTicker === undefined ? [...this.restingByMarket.keys()] : [marketTicker];
+    for (const market of markets) {
+      for (const id of this.restingByMarket.get(market) ?? []) {
+        const order = this.orders.get(id);
+        if (order?.status === 'resting') out.push(order);
+      }
+    }
+    for (const order of this.pending) {
+      if (order.status !== 'pending') continue;
+      if (marketTicker !== undefined && order.marketTicker !== marketTicker) continue;
+      out.push(order);
+    }
+
+    // Stable, so a strategy iterating its own book sees a fixed order.
+    return out.sort((a, b) => a.sequence - b.sequence);
   }
 
   /** Ends the run: everything still live is cancelled at `atMs`. */
   finalize(atMs: bigint): SimulatedOrderUpdate[] {
     const updates: SimulatedOrderUpdate[] = [];
-    for (const order of this.orders.values()) {
-      if (order.status !== 'resting' && order.status !== 'pending') continue;
+    for (const order of this.openOrders()) {
       this.retire(order, 'cancelled', 'end of run', atMs);
       updates.push(this.update(order, 'cancelled', atMs));
     }
     this.pending = [];
+    this.pendingCancels = [];
     return updates;
   }
 }

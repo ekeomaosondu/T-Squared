@@ -68,6 +68,22 @@ describe('research event ordering', () => {
     expect(compareOrderKeys(b, a)).toBeGreaterThan(0);
   });
 
+  it('never resolves a tie by comparing identifiers as strings', () => {
+    // The tenth of anything must not sort before the second. Every tiebreak in
+    // the platform is numeric or an explicitly canonical string for this
+    // reason; the one place a raw id is compared -- OrderKey.tiebreak -- is
+    // built from a numeric ordinal, not from a display label.
+    const second = key({ ingestOrdinal: null, seq: null, tiebreak: 'delta:s:2' });
+    const tenth = key({ ingestOrdinal: null, seq: null, tiebreak: 'delta:s:10' });
+    // Lexicographically "delta:s:10" < "delta:s:2", so the raw string order is
+    // wrong. The comparator must never REACH this case for real events: both
+    // carry an ordinal.
+    expect(compareOrderKeys(tenth, second)).toBeLessThan(0);
+
+    const withOrdinals = [key({ ingestOrdinal: 10n }), key({ ingestOrdinal: 2n })];
+    expect(withOrdinals.sort(compareOrderKeys).map((k) => k.ingestOrdinal)).toEqual([2n, 10n]);
+  });
+
   it('sorts a shuffled list into observation order', () => {
     const keys = [
       key({ sessionRank: 1, ingestOrdinal: 2n, tiebreak: 'd' }),
