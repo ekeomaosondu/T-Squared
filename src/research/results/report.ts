@@ -198,7 +198,9 @@ export function renderComparison(runs: readonly CompletedRun[]): string {
     '  spr    mean half-spread captured per maker fill',
     '  mk1s   total markout at 1s, from the fill price -- includes spr by construction',
     '  drNN   mid DRIFT at that horizon, i.e. the same measurement with spr removed.',
-    '         This is the adverse-selection column. mk minus spr should equal dr.',
+    '         This is the adverse-selection column. Per fill, mk = spr + dr exactly;',
+    '         the column means differ slightly because they average over the fills',
+    '         whose horizon fell inside the recorded data, which is not the same set.',
     '  adv    share of fills the mid moved against within 1s',
     '',
     equality.length === 0
