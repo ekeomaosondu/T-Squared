@@ -42,6 +42,12 @@ const sh = (cmd: string, args: string[], allowFail = false): string => {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** The SHA the image should report, marked when the tree is dirty. */
+function buildSha(): string {
+  const sha = sh('git', ['rev-parse', 'HEAD']);
+  return sh('git', ['status', '--porcelain'], true) ? `${sha}-dirty` : sha;
+}
+
 /**
  * Starts a container and REQUIRES it to still be running.
  *
@@ -89,7 +95,9 @@ async function main(): Promise<void> {
   sh('docker', ['rm', '-f', `${NAME}-nodb`], true);
 
   console.log('  building image...');
-  sh('docker', ['build', '-q', '-t', IMAGE, '.']);
+  // Built the same way `npm run deploy:fly` builds it, so the gate exercises
+  // the real image rather than a variant that happens to lack provenance.
+  sh('docker', ['build', '-q', '--build-arg', `GIT_COMMIT_SHA=${buildSha()}`, '-t', IMAGE, '.']);
 
   // A laptop collector would race the container for subscriptions.
   const laptop = sh('pgrep', ['-f', 'scripts/collector.ts'], true);
@@ -142,6 +150,24 @@ async function main(): Promise<void> {
     'final batch flushed on shutdown',
     Number(firstSession.rows) >= beforeRows,
     `${beforeRows} rows before stop, ${firstSession.rows} after`,
+  );
+
+  // Provenance. The container has no .git, so unless the SHA is passed as a
+  // build argument every production session records NULL here and a window of
+  // the dataset cannot be tied to the code that produced it.
+  const recordedSha = (
+    (await sql`
+      SELECT c.git_commit_sha FROM collector_sessions c
+       WHERE c.session_id = ${firstSession.session_id}
+    `) as unknown as { git_commit_sha: string | null }[]
+  )[0]!.git_commit_sha;
+  const expectedSha = buildSha();
+  check(
+    'session records the build commit',
+    recordedSha === expectedSha,
+    recordedSha === null
+      ? 'git_commit_sha is NULL -- the image was built without --build-arg GIT_COMMIT_SHA'
+      : `recorded ${recordedSha}, expected ${expectedSha}`,
   );
 
   // ---- 2 & 3. Restart begins from fresh snapshots, as a new epoch --------

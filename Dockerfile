@@ -31,10 +31,17 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tini ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Code provenance. .git is excluded from the build context, so the working-tree
+# fallback in gitCommitSha() cannot work inside the image -- every deployed
+# session recorded git_commit_sha = NULL until this was passed in. Supplied by
+# `npm run deploy:fly`; an empty value degrades to NULL exactly as before.
+ARG GIT_COMMIT_SHA=""
+
 ENV NODE_ENV=production \
     COLLECTOR_MODE=daemon \
     HEALTH_PORT=8080 \
-    LOG_PRETTY=false
+    LOG_PRETTY=false \
+    GIT_COMMIT_SHA=$GIT_COMMIT_SHA
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json tsconfig.json ./

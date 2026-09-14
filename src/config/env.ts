@@ -121,6 +121,17 @@ const EnvSchema = z.object({
    */
   DIRECT_DATABASE_URL: z.string().optional().default(''),
 
+  /**
+   * The commit this build was made from, baked in at image build time.
+   *
+   * The container has no .git directory -- it is excluded from the build
+   * context -- so the working-tree fallback below returns null inside Docker.
+   * That silently dropped code provenance on exactly the sessions that matter
+   * most: the production ones. Passed as a build argument by `npm run
+   * deploy:fly`.
+   */
+  GIT_COMMIT_SHA: z.string().optional().default(''),
+
   // Supplied automatically by Vercel; used for session attribution only.
   VERCEL_DEPLOYMENT_ID: z.string().optional().default(''),
   VERCEL_GIT_COMMIT_SHA: z.string().optional().default(''),
@@ -170,6 +181,7 @@ export function redactedEnv(e: Env = env()) {
     kalshiEnv: e.KALSHI_ENV,
     kalshiApiKeyId: e.KALSHI_API_KEY_ID ? `${e.KALSHI_API_KEY_ID.slice(0, 4)}…` : '(unset)',
     kalshiPrivateKey: e.KALSHI_PRIVATE_KEY_PEM ? '(set)' : '(unset)',
+    gitCommitSha: gitCommitSha(e) ?? '(unknown)',
     databaseUrl: e.DATABASE_URL ? redactDatabaseUrl(e.DATABASE_URL) : '(unset)',
     directDatabaseUrl: e.DIRECT_DATABASE_URL ? redactDatabaseUrl(e.DIRECT_DATABASE_URL) : '(unset)',
     blobToken: e.BLOB_READ_WRITE_TOKEN ? '(set)' : '(unset)',
@@ -209,15 +221,21 @@ export function kalshiEndpoints(e: Env = env()) {
 /**
  * The commit this process is running.
  *
- * Vercel supplies VERCEL_GIT_COMMIT_SHA; in daemon mode it is read from the
- * working tree. Recorded on every collector session so a window of the dataset
- * can be tied to the exact code that produced it -- which matters when a
- * parsing or reconstruction change lands mid-collection.
+ * Resolution order, most to least authoritative:
+ *
+ *   GIT_COMMIT_SHA         baked into the container image at build time
+ *   VERCEL_GIT_COMMIT_SHA  supplied by Vercel
+ *   git rev-parse HEAD     the working tree, for local runs
+ *
+ * Recorded on every collector session so a window of the dataset can be tied
+ * to the exact code that produced it -- which matters when a parsing or
+ * reconstruction change lands mid-collection.
  *
  * A dirty working tree is marked, because "the deployed SHA" is then a claim
  * that is not quite true.
  */
 export function gitCommitSha(e: Env = env()): string | null {
+  if (e.GIT_COMMIT_SHA) return e.GIT_COMMIT_SHA;
   if (e.VERCEL_GIT_COMMIT_SHA) return e.VERCEL_GIT_COMMIT_SHA;
 
   try {
