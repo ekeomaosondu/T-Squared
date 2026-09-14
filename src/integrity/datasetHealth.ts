@@ -98,23 +98,42 @@ export async function datasetHealth(
   );
 
   // ---- sequence recovery --------------------------------------------------
-  const gaps = await sql<{ status: string; n: string }[]>`
-    SELECT g.status, count(*) AS n
+  //
+  // A gap is only ACTIONABLE while its stream is still alive: recovery is
+  // per-subscription, so once the stream ends the gap can never reach
+  // 'recovered' and the book has already been rebuilt on a new stream. Counting
+  // those forever is how this check went permanently CRITICAL and stopped
+  // being a signal. The stream-ended ones are reported, not alarmed on.
+  //
+  // A gap is excused only when its stream is KNOWN to have ended. An unknown
+  // stream alarms: the excuse depends on stream bookkeeping, and a check that
+  // goes quiet when its own bookkeeping breaks is worse than one that shouts.
+  const gaps = await sql<{ status: string; stream_ended: boolean; n: string }[]>`
+    SELECT g.status,
+           (s.stream_id IS NOT NULL AND s.ended_at IS NOT NULL) AS stream_ended,
+           count(*) AS n
       FROM sequence_gaps g
+      LEFT JOIN subscription_streams s ON s.stream_id = g.stream_id
      WHERE g.detected_at > now() - interval '24 hours'
-     GROUP BY g.status
+     GROUP BY g.status, 2
   `;
-  const unrecovered = gaps
-    .filter((g) => g.status !== 'recovered')
-    .reduce((n, g) => n + Number(g.n), 0);
   const total = gaps.reduce((n, g) => n + Number(g.n), 0);
+  const recovered = gaps
+    .filter((g) => g.status === 'recovered')
+    .reduce((n, g) => n + Number(g.n), 0);
+  const outstanding = gaps
+    .filter((g) => g.status !== 'recovered' && g.status !== 'superseded' && !g.stream_ended)
+    .reduce((n, g) => n + Number(g.n), 0);
+  const superseded = total - recovered - outstanding;
 
   add(
     'sequence_recovery',
-    unrecovered === 0 ? 'HEALTHY' : 'CRITICAL',
-    unrecovered === 0
-      ? `${total} gap(s) in 24h, all recovered`
-      : `${unrecovered} of ${total} gap(s) unrecovered`,
+    outstanding === 0 ? 'HEALTHY' : 'CRITICAL',
+    outstanding === 0
+      ? superseded === 0
+        ? `${total} gap(s) in 24h, all recovered`
+        : `${total} gap(s) in 24h: ${recovered} recovered, ${superseded} closed by a reconnect`
+      : `${outstanding} of ${total} gap(s) unrecovered on a live stream`,
   );
 
   // ---- partition runway ---------------------------------------------------

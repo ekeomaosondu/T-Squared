@@ -72,6 +72,44 @@ describeDb('dataset health', () => {
     expect(h.critical.join()).toMatch(/unrecovered/);
   });
 
+  it('is HEALTHY once a gap is closed by the stream ending', async () => {
+    // Recovery is per-subscription. When the stream dies the gap can never
+    // reach 'recovered', and the book has already been rebuilt on the next
+    // stream -- so counting it forever turned this check permanently CRITICAL
+    // and stopped it being a signal at all.
+    const session = await liveSession(1);
+    const streamId = randomUUID();
+    await sql`
+      INSERT INTO subscription_streams (stream_id, session_id, channel, sid, started_at, ended_at)
+      VALUES (${streamId}, ${session}, 'orderbook_delta', 1, now() - interval '2 hours', now() - interval '1 hour')
+    `;
+    await sql`
+      INSERT INTO sequence_gaps (session_id, stream_id, channel, detected_at, status)
+      VALUES (${session}, ${streamId}, 'orderbook_delta', now(), 'recovering')
+    `;
+    const h = await datasetHealth(sql);
+    expect(h.level).toBe('HEALTHY');
+    expect(h.checks.find((c) => c.name === 'sequence_recovery')!.detail).toMatch(
+      /closed by a reconnect/,
+    );
+  });
+
+  it('still alarms on an open gap whose stream is STILL LIVE', async () => {
+    const session = await liveSession(1);
+    const streamId = randomUUID();
+    await sql`
+      INSERT INTO subscription_streams (stream_id, session_id, channel, sid, started_at)
+      VALUES (${streamId}, ${session}, 'orderbook_delta', 1, now() - interval '5 minutes')
+    `;
+    await sql`
+      INSERT INTO sequence_gaps (session_id, stream_id, channel, detected_at, status)
+      VALUES (${session}, ${streamId}, 'orderbook_delta', now(), 'recovering')
+    `;
+    const h = await datasetHealth(sql);
+    expect(h.level).toBe('CRITICAL');
+    expect(h.critical.join()).toMatch(/live stream/);
+  });
+
   it('is HEALTHY when a gap was recorded and recovered', async () => {
     const session = await liveSession(1);
     await sql`

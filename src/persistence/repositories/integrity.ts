@@ -162,6 +162,24 @@ export async function markGapFailed(sql: Sql, gapId: string, notes: string): Pro
   `;
 }
 
+/**
+ * Closes a gap whose stream ended before recovery could complete.
+ *
+ * Deliberately NOT 'recovered'. The missed messages are gone; what happened is
+ * that the stream died and the next one re-seeded every book from a fresh
+ * snapshot, so no further action is possible. Recording that as recovery would
+ * claim we retrieved data we did not.
+ */
+export async function markGapSuperseded(sql: Sql, gapId: string, notes: string): Promise<void> {
+  await sql`
+    UPDATE sequence_gaps
+       SET status = 'superseded',
+           notes  = coalesce(notes || ' | ', '') || ${notes}
+     WHERE id = ${gapId}::bigint
+       AND status <> 'recovered'
+  `;
+}
+
 export async function countGapsSince(sql: Sql, since: Date): Promise<number> {
   const rows = await sql<{ n: string }[]>`
     SELECT count(*)::text AS n FROM sequence_gaps WHERE detected_at >= ${since}

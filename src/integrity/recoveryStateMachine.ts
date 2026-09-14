@@ -265,10 +265,21 @@ export class StreamRecoveryMachine {
     return timedOut;
   }
 
-  close(streamId: string): void {
+  /**
+   * Closes a stream, returning any episode that was still open.
+   *
+   * The RETURN matters. Dropping the episode silently left its sequence_gaps
+   * row at 'recovering' forever, and the health check counted it as
+   * unrecovered for all time -- an alarm that is always on. The caller marks
+   * the row superseded instead: the missed messages are gone, the book will be
+   * rebuilt on the next stream, and nothing further can be done.
+   */
+  close(streamId: string): RecoveryEpisode | null {
+    const episode = this.episodes.get(streamId) ?? null;
     this.episodes.delete(streamId);
     this.setState(streamId, 'closed', 'stream_closed');
     this.states.delete(streamId);
+    return episode;
   }
 
   reset(): void {

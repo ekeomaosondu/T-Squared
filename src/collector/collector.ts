@@ -25,6 +25,7 @@ import {
   markGapFailed,
   markGapRecovered,
   markGapRecovering,
+  markGapSuperseded,
   recordSequenceGap,
 } from '@/src/persistence/repositories/integrity';
 import {
@@ -418,7 +419,37 @@ export class Collector extends EventEmitter {
     for (const sub of streams) {
       await closeStream(this.sql, sub.streamId).catch(() => {});
       this.sequences.remove(sub.streamId);
-      this.recovery.close(sub.streamId);
+
+      // A gap still open when its stream dies can never reach 'recovered':
+      // recovery is per-subscription and that subscription is gone. Leaving it
+      // open kept the health check permanently CRITICAL, so it is closed as
+      // superseded -- which says the messages are lost and the book will be
+      // rebuilt, rather than claiming a recovery that did not happen.
+      const orphaned = this.recovery.close(sub.streamId);
+      if (orphaned?.gapId) {
+        const sql = this.sql;
+        const gapId = orphaned.gapId;
+        const outstanding = orphaned.outstanding.size;
+        this.defer(async () => {
+          await markGapSuperseded(
+            sql,
+            gapId,
+            `stream closed with ${outstanding} market(s) outstanding; ` +
+              'the next stream re-seeds every book from a fresh snapshot',
+          ).catch(() => {});
+        });
+      }
+    }
+
+    for (const episode of this.recovery.openEpisodes()) {
+      if (!episode.gapId) continue;
+      const sql = this.sql;
+      const gapId = episode.gapId;
+      this.defer(async () => {
+        await markGapSuperseded(sql, gapId, 'collector disconnected before recovery completed').catch(
+          () => {},
+        );
+      });
     }
     this.recovery.reset();
 
