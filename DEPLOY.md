@@ -89,3 +89,41 @@ one starts, so two collectors never hold subscriptions for the same markets at
 once. A brief gap in collection is the correct trade — a gap is visible in
 `sequence_gaps` and in session boundaries, whereas overlapping collectors
 produce two epochs that look valid individually and cannot be reconciled.
+
+## Rotating the R2 credentials
+
+The archive credentials are long-lived and only rotate on purpose. Rotate them
+when they may have been exposed — pasted into a chat, a ticket or a log — or
+when the daemon moves host.
+
+Only step 1 is manual; everything else verifies itself.
+
+```bash
+# 1. Cloudflare dashboard -> R2 -> Manage API tokens -> Create.
+#    Scope: Object Read & Write on the archive bucket only.
+#    Put the new values straight into .env.local. Nowhere else.
+
+# 2. Prove they work: probe write/read/delete, plus a real archive read
+#    checked against its recorded SHA-256. A write-only token passes a naive
+#    check and then silently breaks every restore, so read scope is tested
+#    against something the OLD token wrote.
+npm run rotate:r2
+
+# 3. Stage them on Fly and deploy.
+npm run rotate:r2 -- --apply
+npm run deploy:fly
+
+# 4. Confirm the collector came back on the new credentials.
+fly status
+curl -s https://kalshi-market-recorder.fly.dev/health | head -40
+
+# 5. Delete the OLD token in the Cloudflare dashboard.
+
+# 6. Confirm nothing depended on it.
+npm run rotate:r2
+npm run restore -- --partition <most recent archived partition>
+```
+
+Step 6 matters more than it looks. The restore gate reads real archive bytes
+back out of R2 and replays them, so it is the only check that proves the new
+token can still reach everything the old one wrote.
