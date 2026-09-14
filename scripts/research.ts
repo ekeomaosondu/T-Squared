@@ -30,6 +30,9 @@ import { logger } from '@/src/logging/logger';
  *                                --fill-model conservative_queue --latency-ms 100
  *   npm run research -- compare  --config experiments/baseline.yaml
  *
+ * --counterfactual-fills touch,queue_decay runs those assumptions alongside
+ * the primary one in a SINGLE pass, on exactly the orders the strategy placed.
+ *
  * `describe` resolves a slice without reading it. `verify` replays the book
  * and checks it against the collector's own recorded hashes -- run it on a new
  * day before trusting any result from that day.
@@ -149,6 +152,7 @@ interface BacktestSpec {
   fillModel: string;
   fillModelParams: Record<string, unknown>;
   latencyMs: number;
+  counterfactualFills: string[];
   feeModel: string;
   feeModelParams: { schedulePath?: string };
 }
@@ -171,6 +175,9 @@ async function runOne(
     request,
     strategy: makeStrategy(spec.strategy, spec.strategyParams),
     fillModel: makeFillModel(spec.fillModel, spec.fillModelParams),
+    counterfactualFillModels: spec.counterfactualFills
+      .filter((n) => n !== spec.fillModel)
+      .map((n) => makeFillModel(n)),
     feeModel: await makeFeeModel(spec.feeModel, spec.feeModelParams),
     latency: makeLatencyModel(spec.latencyMs),
     verifyCheckpoints: opts.verifyCheckpoints,
@@ -191,6 +198,8 @@ function specFromArgs(args: Args): BacktestSpec {
     fillModel: args.flags.get('fill-model') ?? 'conservative_queue',
     fillModelParams: JSON.parse(args.flags.get('fill-params') ?? '{}') as Record<string, unknown>,
     latencyMs: Number(args.flags.get('latency-ms') ?? 0),
+    counterfactualFills:
+      args.flags.get('counterfactual-fills')?.split(',').map((v) => v.trim()).filter(Boolean) ?? [],
     feeModel: args.flags.get('fee-model') ?? 'kalshi_historical',
     feeModelParams: { schedulePath: args.flags.get('fee-schedule') },
   };
@@ -200,12 +209,21 @@ async function backtest(args: Args): Promise<void> {
   const request = buildRequest(args);
   const source = openLake();
   try {
-    const run = await runOne(source, request, specFromArgs(args), {
+    const spec = specFromArgs(args);
+  const run = await runOne(source, request, spec, {
       write: !args.bools.has('no-write'),
       verifyCheckpoints: !args.bools.has('no-verify'),
       maxEvents: args.flags.has('max-events') ? Number(args.flags.get('max-events')) : undefined,
     });
     console.log(renderRun(run.manifest, run.summary));
+    if (run.result.counterfactuals.length > 0) {
+      console.log('  same orders under other queue assumptions');
+      console.log(`    ${spec.fillModel.padEnd(22)} ${String(run.result.fills.length).padStart(6)} fills  (primary)`);
+      for (const c of run.result.counterfactuals) {
+        console.log(`    ${c.fillModel.padEnd(22)} ${String(c.fills.length).padStart(6)} fills`);
+      }
+      console.log('');
+    }
   } finally {
     await source.close();
   }
@@ -260,6 +278,7 @@ async function compare(args: Args): Promise<void> {
           fillModel,
           fillModelParams: {},
           latencyMs,
+          counterfactualFills: [],
           feeModel: config.feeModel ?? 'kalshi_historical',
           feeModelParams: {},
         });

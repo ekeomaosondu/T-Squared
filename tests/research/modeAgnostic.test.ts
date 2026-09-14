@@ -68,7 +68,7 @@ describe('strategy code is mode-agnostic', () => {
     for (const dir of STRATEGY_DIRS) {
       for (const file of filesUnder(dir)) {
         const source = readFileSync(file, 'utf8').replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, '');
-        for (const mode of ['backtest', 'paper', 'shadow', 'live']) {
+        for (const mode of ['backtest', 'shadow', 'calibration', 'live']) {
           if (new RegExp(`['"\`]${mode}['"\`]`).test(source)) {
             violations.push(`${rel(file)} branches on the literal "${mode}"`);
           }
@@ -87,9 +87,19 @@ describe('the simulation is deterministic by construction', () => {
     path.join(ROOT, 'engine', 'runBacktest.ts'),
     path.join(ROOT, 'results', 'runManifest.ts'),
     path.join(ROOT, 'results', 'resultWriter.ts'),
+    // The LIVE feed. Wall time is not a defect here, it is the input: a
+    // shadow run's clock is the socket's arrival times and its stop condition
+    // is a real duration. The rule this test enforces is about the SIMULATED
+    // path, and a live adapter is by definition not on it. The exemption is
+    // one file wide, and everything downstream of it -- engine, strategies,
+    // fill models, metrics -- stays under the rule.
+    path.join(ROOT, 'data', 'liveKalshiSource.ts'),
   ]);
 
   it('never reads wall time or randomness in the simulated path', () => {
+    // Exemptions are listed above and each one is justified there. A new file
+    // failing this test should almost always be fixed rather than exempted:
+    // the list is short on purpose.
     const forbidden = [
       { pattern: /\bDate\.now\s*\(/, why: 'Date.now() -- use ctx.clock.nowMs()' },
       { pattern: /\bsetTimeout\s*\(/, why: 'setTimeout -- use ctx.scheduleAfter()' },

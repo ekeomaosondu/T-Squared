@@ -51,7 +51,7 @@ function marketState(over: Partial<HistoricalMarketState> = {}): HistoricalMarke
 
 /** Buys 10 YES at 0.40 by crossing, then does nothing. */
 class BuyOnce extends BaseStrategy {
-  readonly name = 'buy-once';
+  readonly name: string = 'buy-once';
   private done = false;
   onBookUpdate(_e: unknown, ctx: StrategyContext): void {
     if (this.done) return;

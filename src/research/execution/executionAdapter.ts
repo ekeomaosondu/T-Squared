@@ -18,7 +18,24 @@ import type { Action, OrderIntent, Side, TimeInForce } from '@/src/research/stra
  * where the metrics pipeline can read it and a strategy cannot.
  */
 
-export type ExecutionMode = 'backtest' | 'shadow' | 'paper' | 'live';
+/**
+ * Where a strategy's intents actually go.
+ *
+ *   BACKTEST     recorded data, simulated execution
+ *   SHADOW       LIVE data, no real orders, hypothetical execution recorded
+ *   CALIBRATION  live data, REAL orders at tiny fixed size, placed to learn
+ *                execution mechanics rather than to make money
+ *   LIVE         real strategy, real risk, a PnL objective
+ *
+ * There is deliberately no "paper" mode. Paper suggests simulated execution,
+ * and CALIBRATION is the opposite: it places real orders precisely because
+ * simulated execution is the quantity being estimated. Shadow trading can
+ * validate timing, signals and hypothetical fills, but it cannot calibrate
+ * queue position -- if an order is never on the exchange, the exchange cannot
+ * say where in the FIFO it would have been. Only real resting orders answer
+ * that, which is why CALIBRATION exists and why it is named for its purpose.
+ */
+export type ExecutionMode = 'backtest' | 'shadow' | 'calibration' | 'live';
 
 export type OrderStatus = 'pending' | 'resting' | 'filled' | 'cancelled' | 'rejected';
 

@@ -80,6 +80,20 @@ export interface BacktestOptions {
   markIntervalMs?: number;
   /** Stop after this many events. For smoke tests only. */
   maxEvents?: number;
+  /**
+   * Additional fill models to run ALONGSIDE the primary one.
+   *
+   * Each gets its own exchange and portfolio, sees the same events and the
+   * same intents, and reports its own fills -- but never calls the strategy.
+   * The strategy's inventory has to follow exactly one execution reality or it
+   * is not a strategy, so the counterfactuals are observed and never fed back.
+   *
+   * This is what makes a shadow run answer "what would each queue assumption
+   * have produced on this same live stream", which cannot be done by rerunning
+   * -- live data does not come twice. It also collapses a fill-model sweep of
+   * a recorded day into a single pass.
+   */
+  counterfactualFillModels?: FillModel[];
   /** Recorded in the manifest. Nothing in Phase 1 is stochastic. */
   randomSeed?: number;
   /**
@@ -113,6 +127,21 @@ export interface SettlementReport {
   basisCounts: Record<string, number>;
 }
 
+/**
+ * What a different fill assumption would have produced on the same stream.
+ *
+ * No strategy callbacks fire for these, so the ORDERS are identical to the
+ * primary run by construction and only the FILLS differ. That isolation is
+ * what makes the comparison meaningful: any difference is the queue model and
+ * nothing else.
+ */
+export interface CounterfactualResult {
+  fillModel: string;
+  fillModelParameters: Record<string, unknown>;
+  fills: SimulatedFill[];
+  portfolio: Portfolio;
+}
+
 /** An interval in which the run refused to trust the book. */
 export interface InvalidInterval {
   marketTicker: string;
@@ -132,6 +161,8 @@ export interface BacktestRunResult {
   marketStates: Map<string, HistoricalMarketState>;
   /** How each held position finished, and why. */
   settlement: SettlementReport;
+  /** Same stream, same intents, different queue assumption. */
+  counterfactuals: CounterfactualResult[];
   /** Compact equity curve on the mark grid. */
   equityCurve: EquityRow[];
   counts: {
@@ -169,6 +200,11 @@ export class BacktestEngine {
   private readonly portfolio = new Portfolio();
   private readonly midSeries = new MidSeriesStore();
   private readonly exchange: SimulatedExchange;
+  private readonly counterfactuals: {
+    model: FillModel;
+    exchange: SimulatedExchange;
+    portfolio: Portfolio;
+  }[] = [];
   private readonly adapter: SimulatedExecutionAdapter;
   private readonly ctx: StrategyContext;
 
@@ -226,7 +262,26 @@ export class BacktestEngine {
       gapOrderPolicy: opts.gapOrderPolicy,
       marketStates: this.marketStateRef,
     });
-    this.adapter = new SimulatedExecutionAdapter(this.exchange);
+    for (const model of opts.counterfactualFillModels ?? []) {
+      this.counterfactuals.push({
+        model,
+        exchange: new SimulatedExchange({
+          state: this.state,
+          fillModel: model,
+          feeModel: opts.feeModel,
+          latency: opts.latency,
+          gapOrderPolicy: opts.gapOrderPolicy,
+          marketStates: this.marketStateRef,
+        }),
+        portfolio: new Portfolio(),
+      });
+    }
+
+    this.adapter = new SimulatedExecutionAdapter(this.exchange, {
+      // Intents fan out to every counterfactual, so all of them see exactly
+      // the orders the strategy actually placed.
+      alsoSubmitTo: this.counterfactuals.map((c) => c.exchange),
+    });
 
     this.ctx = createContext({
       clock: this.clock,
@@ -305,10 +360,12 @@ export class BacktestEngine {
       // timestamp of a favourable print misses it, and a cancel that becomes
       // effective on that timestamp does not save us from the fill.
       this.applyExchange(this.exchange.advanceTo(at - 1n));
+      this.advanceCounterfactuals(at - 1n);
 
       this.handle(event);
 
       this.applyExchange(this.exchange.advanceTo(at));
+      this.advanceCounterfactuals(at);
 
       this.maybeMark(at);
 
@@ -324,6 +381,7 @@ export class BacktestEngine {
     if (lastEventMs !== null) {
       this.checkCheckpointsUpTo(lastEventMs + 1n);
       this.applyExchange({ updates: this.exchange.finalize(lastEventMs), fills: [] });
+      for (const c of this.counterfactuals) c.exchange.finalize(lastEventMs);
       this.mark(lastEventMs);
       for (const [ticker, interval] of this.gapOpen) {
         interval.toMs = lastEventMs.toString();
@@ -350,6 +408,12 @@ export class BacktestEngine {
       invalidIntervals: this.invalidIntervals,
       marketStates: this.marketStates,
       settlement,
+      counterfactuals: this.counterfactuals.map((c) => ({
+        fillModel: c.model.name,
+        fillModelParameters: c.model.describe(),
+        fills: c.exchange.fills,
+        portfolio: c.portfolio,
+      })),
       equityCurve: this.equityCurve,
       counts: this.counts,
       bookStats: this.state.stats,
@@ -397,6 +461,7 @@ export class BacktestEngine {
       wasGapped.toMs = event.receiveTimeMs.toString();
       this.gapOpen.delete(event.marketTicker);
       this.exchange.onCaptureResume(event.marketTicker);
+      for (const c of this.counterfactuals) c.exchange.onCaptureResume(event.marketTicker);
       this.opts.strategy.onDataResume(event.marketTicker, this.ctx);
     }
 
@@ -411,6 +476,7 @@ export class BacktestEngine {
 
     // Queue estimates move on the recorder's own pre/post counts.
     this.exchange.onBookDelta(event);
+    for (const c of this.counterfactuals) c.exchange.onBookDelta(event);
 
     this.recordMid(event.marketTicker, event.receiveTimeMs);
     this.opts.strategy.onBookUpdate(event, this.ctx);
@@ -423,6 +489,9 @@ export class BacktestEngine {
     this.midSeries.for(event.marketTicker).observe(event.receiveTimeMs);
     const fills = this.exchange.onTrade(event);
     this.applyExchange({ updates: [], fills });
+    for (const c of this.counterfactuals) {
+      for (const fill of c.exchange.onTrade(event)) c.portfolio.applyFill(fill);
+    }
     this.opts.strategy.onTrade(event, this.ctx);
   }
 
@@ -457,6 +526,9 @@ export class BacktestEngine {
         updates: this.exchange.onCaptureGap(invalidated, event.receiveTimeMs),
         fills: [],
       });
+      for (const c of this.counterfactuals) {
+        c.exchange.onCaptureGap(invalidated, event.receiveTimeMs);
+      }
     }
 
     this.opts.strategy.onDataGap(event, this.ctx);
@@ -572,6 +644,13 @@ export class BacktestEngine {
     return report;
   }
 
+  private advanceCounterfactuals(atMs: bigint): void {
+    for (const c of this.counterfactuals) {
+      const { fills } = c.exchange.advanceTo(atMs);
+      for (const fill of fills) c.portfolio.applyFill(fill);
+    }
+  }
+
   private hasMark(marketTicker: string): boolean {
     const view = this.state.view(marketTicker);
     return view?.valid === true && view.bbo().mid !== null;
@@ -584,6 +663,7 @@ export class BacktestEngine {
       for (const timer of this.scheduler.drainDue(due)) {
         this.clock.advanceTo(timer.dueMs);
         this.applyExchange(this.exchange.advanceTo(timer.dueMs));
+        this.advanceCounterfactuals(timer.dueMs);
         this.counts.timers += 1;
         this.opts.strategy.onTimer(timerEvent(timer, 'simulated'), this.ctx);
       }

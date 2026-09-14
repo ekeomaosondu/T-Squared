@@ -37,6 +37,8 @@ export interface RunManifest {
 
   fillModel: string;
   fillModelParameters: Record<string, unknown>;
+  /** Queue assumptions run alongside the primary one on the same orders. */
+  counterfactualFillModels: string[];
   latencyModel: Record<string, unknown>;
   feeModel: Record<string, unknown>;
 
@@ -69,6 +71,7 @@ export interface RunKeyInputs {
   marketTickers?: string[];
   fillModel: string;
   fillModelParameters: Record<string, unknown>;
+  counterfactualFillModels: string[];
   latencyModel: Record<string, unknown>;
   feeModel: Record<string, unknown>;
   captureGapPolicy: string;

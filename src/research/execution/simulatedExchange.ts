@@ -83,6 +83,26 @@ export interface SimulatedOrder extends Omit<WorkingOrder, 'status'> {
 
   queue: QueueState | null;
   rejectReason: string | null;
+
+  /**
+   * The book as it stood when the STRATEGY decided, and again when the order
+   * ARRIVED.
+   *
+   * The gap between the two is what latency actually cost, measured rather
+   * than assumed. Recorded on every order because comparing them is the whole
+   * point of a shadow or calibration run, and reconstructing them afterwards
+   * from a separate replay would be comparing the simulator to itself.
+   */
+  decisionBid: Decimal | null;
+  decisionAsk: Decimal | null;
+  decisionBidSize: Decimal | null;
+  decisionAskSize: Decimal | null;
+  decisionBookHash: string | null;
+
+  arrivalBid: Decimal | null;
+  arrivalAsk: Decimal | null;
+  /** Displayed size at the order's own level when it arrived: the queue ahead. */
+  arrivalDisplayedSize: Decimal | null;
 }
 
 /** A Fill plus everything only a simulator can know about why it happened. */
@@ -256,6 +276,13 @@ export class SimulatedExchange {
 
     const yesPrice = yesEquivalentPrice(intent.side, intent.action, price);
     const sequence = ++this.orderSeq;
+
+    // Captured at the DECISION, not reconstructed later. What the strategy
+    // could see when it acted is the only honest baseline for what the latency
+    // then cost it.
+    const decisionView = this.state.view(intent.marketTicker);
+    const decisionBbo = decisionView?.valid ? decisionView.bbo() : null;
+
     const order: SimulatedOrder = {
       orderId: `o${sequence}`,
       sequence,
@@ -282,6 +309,14 @@ export class SimulatedExchange {
       terminalAtMs: null,
       queue: null,
       rejectReason: null,
+      decisionBid: decisionBbo?.bid ?? null,
+      decisionAsk: decisionBbo?.ask ?? null,
+      decisionBidSize: decisionBbo?.bidSize ?? null,
+      decisionAskSize: decisionBbo?.askSize ?? null,
+      decisionBookHash: decisionView?.valid ? decisionView.stateHash() : null,
+      arrivalBid: null,
+      arrivalAsk: null,
+      arrivalDisplayedSize: null,
     };
 
     this.orders.set(order.orderId, order);
@@ -383,6 +418,15 @@ export class SimulatedExchange {
       updates.push(this.update(order, 'rejected', nowMs));
       return { updates, fills };
     }
+
+    const arrival = view.bbo();
+    order.arrivalBid = arrival.bid;
+    order.arrivalAsk = arrival.ask;
+    const ladderAtArrival = ladderOf(order);
+    order.arrivalDisplayedSize =
+      ladderAtArrival.side === 'yes'
+        ? view.yesBidSizeAt(order.yesPrice)
+        : view.yesAskSizeAt(order.yesPrice);
 
     fills.push(...this.cross(order, view, nowMs));
 
@@ -778,14 +822,26 @@ export class SimulatedExecutionAdapter implements ExecutionAdapter {
   readonly mode: ExecutionMode = 'backtest';
   readonly name = 'simulated';
 
-  constructor(private readonly exchange: SimulatedExchange) {}
+  /**
+   * @param alsoSubmitTo counterfactual exchanges that must see the same
+   *        intents. Their updates are discarded here: only the primary
+   *        exchange drives strategy callbacks, because a strategy whose
+   *        inventory follows several execution realities at once does not have
+   *        an inventory.
+   */
+  constructor(
+    private readonly exchange: SimulatedExchange,
+    private readonly opts: { alsoSubmitTo?: SimulatedExchange[] } = {},
+  ) {}
 
   describe(): Record<string, unknown> {
     return { adapter: 'simulated', mode: this.mode };
   }
 
   submit(intent: OrderIntent, nowMs: bigint): OrderUpdate[] {
-    return this.exchange.submit(intent, nowMs);
+    const updates = this.exchange.submit(intent, nowMs);
+    for (const other of this.opts.alsoSubmitTo ?? []) other.submit(intent, nowMs);
+    return updates;
   }
 
   openOrders(marketTicker?: string): WorkingOrder[] {

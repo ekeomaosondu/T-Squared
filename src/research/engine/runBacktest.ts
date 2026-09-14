@@ -29,6 +29,8 @@ export interface RunBacktestOptions {
   request: HistoricalRequest;
   strategy: Strategy;
   fillModel: FillModel;
+  /** Additional queue assumptions run on the same orders. See BacktestOptions. */
+  counterfactualFillModels?: FillModel[];
   feeModel: FeeModel;
   latency: LatencyModel;
   gapPolicy?: BacktestOptions['gapPolicy'];
@@ -58,6 +60,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<CompletedRu
     request: opts.request,
     strategy: opts.strategy,
     fillModel: opts.fillModel,
+    counterfactualFillModels: opts.counterfactualFillModels,
     feeModel: opts.feeModel,
     latency: opts.latency,
     gapPolicy: opts.gapPolicy,
@@ -90,6 +93,9 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<CompletedRu
     marketTickers: opts.request.marketTickers,
     fillModel: opts.fillModel.name,
     fillModelParameters: opts.fillModel.describe(),
+    // Counterfactuals do not change the primary result, but they do change
+    // what the run directory contains, so they belong in the run key.
+    counterfactualFillModels: (opts.counterfactualFillModels ?? []).map((m) => m.name),
     latencyModel: opts.latency.describe(),
     feeModel: opts.feeModel.provenance() as unknown as Record<string, unknown>,
     captureGapPolicy: gapPolicy,
