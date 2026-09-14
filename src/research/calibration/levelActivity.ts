@@ -1,4 +1,5 @@
-import { Decimal, D, ONE, ZERO, canonicalPrice } from '@/src/book/decimal';
+import { Decimal, D, ZERO, canonicalPrice } from '@/src/book/decimal';
+import { publicLevelFor, yesPriceOfPublicLevel } from '@/src/book/ladder';
 import type { BookDeltaEvent, TradeEvent } from '@/src/research/events/researchEvent';
 
 /**
@@ -42,14 +43,19 @@ const empty = (): LevelActivity => ({
   unreconciledTradeVolume: ZERO,
 });
 
-/** The book ladder a probe rests on, in the exchange's own terms. */
-export function ladderFor(side: 'bid' | 'ask', yesPrice: Decimal): {
-  bookSide: 'yes' | 'no';
-  bookPrice: string;
-} {
-  return side === 'bid'
-    ? { bookSide: 'yes', bookPrice: canonicalPrice(yesPrice) }
-    : { bookSide: 'no', bookPrice: canonicalPrice(ONE.minus(yesPrice)) };
+/**
+ * The book ladder a probe rests on.
+ *
+ * Delegates to the shared mapping. This module used to derive the complement
+ * itself, which made three independent derivations of the same inversion in
+ * code whose only output is a claim about queue position.
+ */
+export function ladderFor(
+  side: 'bid' | 'ask',
+  yesPrice: Decimal,
+): { bookSide: 'yes' | 'no'; bookPrice: string } {
+  const level = publicLevelFor(side, yesPrice);
+  return { bookSide: level.side, bookPrice: level.price };
 }
 
 export class LevelActivityTracker {
@@ -116,10 +122,9 @@ export class LevelActivityTracker {
    */
   onTrade(event: TradeEvent): void {
     if (event.takerOutcomeSide === null) return;
-    const yesPrice = D(event.yesPrice);
+    // A taker buying YES consumes YES asks, which are published as NO bids.
     const bookSide = event.takerOutcomeSide === 'yes' ? 'no' : 'yes';
-    const bookPrice =
-      bookSide === 'yes' ? canonicalPrice(yesPrice) : canonicalPrice(ONE.minus(yesPrice));
+    const bookPrice = yesPriceOfPublicLevel(bookSide, D(event.yesPrice));
 
     const key = LevelActivityTracker.key(event.marketTicker, bookSide, bookPrice);
     const activity = this.watched.get(key);
@@ -143,6 +148,16 @@ export class LevelActivityTracker {
 export class RecentActivity {
   private readonly trades = new Map<string, number[]>();
   private readonly deltas = new Map<string, number[]>();
+  /**
+   * Instants at which the touch MOVED, as opposed to merely changing size.
+   *
+   * The quantity that matters for studying better-priced depth: a probe only
+   * ends up behind a better price if one appears, and in a market whose touch
+   * never moves that can never happen. Counting deltas would not distinguish
+   * a busy level from a moving one.
+   */
+  private readonly bboChanges = new Map<string, number[]>();
+  private readonly lastBbo = new Map<string, string>();
 
   constructor(private readonly windowMs: number = 120_000) {}
 
@@ -171,6 +186,18 @@ export class RecentActivity {
 
   recordTrade(ticker: string, atMs: number): void {
     this.push(this.trades, ticker, atMs);
+  }
+
+  /** Records a touch observation, counting it only when the PRICES move. */
+  recordBbo(ticker: string, atMs: number, bid: string | null, ask: string | null): void {
+    const key = `${bid ?? '-'}|${ask ?? '-'}`;
+    if (this.lastBbo.get(ticker) === key) return;
+    this.lastBbo.set(ticker, key);
+    this.push(this.bboChanges, ticker, atMs);
+  }
+
+  bboChangesIn(ticker: string, nowMs: number): number {
+    return this.count(this.bboChanges, ticker, nowMs);
   }
   recordDelta(ticker: string, atMs: number): void {
     this.push(this.deltas, ticker, atMs);

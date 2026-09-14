@@ -21,6 +21,7 @@ import {
   LevelActivityTracker,
   RecentActivity,
 } from '@/src/research/calibration/levelActivity';
+import { ticksFromTouch } from '@/src/book/ladder';
 import {
   assessEligibility,
   chooseDwellMs,
@@ -78,6 +79,14 @@ export interface CalibrationConfig {
   expirationSlackMs: number;
   /** Placed orders are suppressed. Everything else runs. */
   dryRun: boolean;
+  /**
+   * Break stratum ties toward markets whose touch moves often.
+   *
+   * For the diagnostic run that has to produce observations where our probe
+   * ends up BEHIND a newly improved price -- the regime the first audit had
+   * almost no data for, and the one where better-priced depth could matter.
+   */
+  preferChurn?: boolean;
   fillModels: FillModel[];
   random?: () => number;
 }
@@ -338,6 +347,16 @@ export class CalibrationRunner {
         const applied = this.state.applyDelta(event);
         if (applied.applied) {
           this.activity.recordDelta(event.marketTicker, Number(event.receiveTimeMs));
+          const view = this.state.view(event.marketTicker);
+          if (view?.valid) {
+            const b = view.bbo();
+            this.activity.recordBbo(
+              event.marketTicker,
+              Number(event.receiveTimeMs),
+              b.bid?.toFixed(6) ?? null,
+              b.ask?.toFixed(6) ?? null,
+            );
+          }
           this.levels.onDelta(event);
           for (const c of this.counterfactuals) c.exchange.onBookDelta(event);
         }
@@ -492,7 +511,9 @@ export class CalibrationRunner {
       return;
     }
 
-    const chosen = selectNext(candidates, this.sampledByStratum, this.random);
+    const chosen = selectNext(candidates, this.sampledByStratum, this.random, {
+      preferChurn: this.config.preferChurn,
+    });
     if (!chosen) {
       this.nextProbeAtMs = now + 2_000;
       return;
@@ -563,6 +584,7 @@ export class CalibrationRunner {
         stratum: eligibility.stratum,
         mid: eligibility.mid,
         touchDepth: eligibility.touchDepth ?? ZERO,
+        bboChanges: this.activity.bboChangesIn(ticker, nowMs),
       });
     }
     return out;
@@ -587,8 +609,8 @@ export class CalibrationRunner {
     const priceCents = Number(sidePrice.mul(100).toFixed(0));
     if (priceCents < 1 || priceCents > 99) return;
 
-    const displayed =
-      side === 'bid' ? book.yesBidSizeAt(yesPrice) : book.yesAskSizeAt(yesPrice);
+    const aheadAtEntry = book.depthAhead(side, yesPrice);
+    const displayed = aheadAtEntry.sameLevel;
 
     const decisionTsMs = Date.now();
     const expirationTs = Math.floor((decisionTsMs + dwellMs + this.config.expirationSlackMs) / 1000);
@@ -616,6 +638,7 @@ export class CalibrationRunner {
       decisionImbalance1: book.imbalance(1),
       decisionImbalance3: book.imbalance(3),
       displayedSizeAtEntry: displayed,
+      betterDepthAtEntry: aheadAtEntry.better,
       clientOrderId,
       orderSide,
       orderAction: 'buy',
@@ -936,10 +959,14 @@ export class CalibrationRunner {
       const queuePosition = byOrder.get(probe.orderId!) ?? null;
       const book = this.state.view(probe.marketTicker);
       const bbo = book?.valid ? book.bbo() : null;
-      const displayed = book?.valid
-        ? probe.side === 'bid'
-          ? book.yesBidSizeAt(probe.yesPrice)
-          : book.yesAskSizeAt(probe.yesPrice)
+      // The FULL ahead-of-us quantity, not just our own level. Kalshi counts
+      // everything that must match before we can fill, and a probe that does
+      // not reprice accumulates better-priced depth in front of it whenever
+      // the market improves past it.
+      const ahead = book?.valid ? book.depthAhead(probe.side, probe.yesPrice) : null;
+      const displayed = ahead?.sameLevel ?? null;
+      const ticks = book?.valid
+        ? ticksFromTouch(probe.side, probe.yesPrice, bbo?.bid ?? null, bbo?.ask ?? null)
         : null;
       const activity = this.levels.snapshot(probe.levelKey);
 
@@ -984,6 +1011,10 @@ export class CalibrationRunner {
           cumRemoved: activity.removed,
           cumAdded: activity.added,
           cumTrades: activity.trades,
+          betterDepth: ahead?.better ?? null,
+          betterLevels: ahead?.betterLevels ?? null,
+          totalPublicAhead: ahead === null ? null : ahead.better.plus(ahead.sameLevel),
+          ticksFromTouch: ticks,
         })
         .catch((err) => {
           // Persistence is a stop condition: a probe whose observations are not

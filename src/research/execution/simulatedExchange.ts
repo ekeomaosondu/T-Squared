@@ -1,4 +1,5 @@
 import { Decimal, D, ONE, ZERO, canonicalPrice } from '@/src/book/decimal';
+import { publicLevelFor } from '@/src/book/ladder';
 import type { BookDeltaEvent, TradeEvent } from '@/src/research/events/researchEvent';
 import type { BookView, MarketStateStore } from '@/src/research/engine/marketState';
 import type { FeeModel } from '@/src/research/portfolio/fees';
@@ -164,11 +165,14 @@ export interface SimulatedExchangeOptions {
 
 const remainingOf = (o: SimulatedOrder) => o.quantity.minus(o.filledQuantity);
 
-/** The book ladder a resting order actually sits on. */
+/**
+ * The book ladder a resting order actually sits on.
+ *
+ * Delegates to the shared mapping so the complement is derived in one place.
+ */
 function ladderOf(order: SimulatedOrder): { side: 'yes' | 'no'; price: string } {
-  return order.yesAction === 'buy'
-    ? { side: 'yes', price: canonicalPrice(order.yesPrice) }
-    : { side: 'no', price: canonicalPrice(ONE.minus(order.yesPrice)) };
+  const level = publicLevelFor(order.yesAction === 'buy' ? 'bid' : 'ask', order.yesPrice);
+  return { side: level.side, price: level.price };
 }
 
 export class SimulatedExchange {

@@ -144,6 +144,8 @@ export interface Candidate {
   stratum: StratumKey;
   mid: Decimal;
   touchDepth: Decimal;
+  /** Times the touch MOVED in the recent window. */
+  bboChanges: number;
 }
 
 /**
@@ -156,6 +158,7 @@ export function selectNext(
   candidates: readonly Candidate[],
   sampledByStratum: ReadonlyMap<string, number>,
   random: () => number,
+  opts: { preferChurn?: boolean } = {},
 ): Candidate | null {
   if (candidates.length === 0) return null;
 
@@ -170,6 +173,15 @@ export function selectNext(
       pool.push(candidate);
     }
   }
+
+  // Stratum rotation still comes first; churn only breaks the tie WITHIN the
+  // least-sampled stratum. Letting it override the rotation would trade one
+  // selection bias for another.
+  if (opts.preferChurn && pool.length > 1) {
+    const most = Math.max(...pool.map((c) => c.bboChanges));
+    if (most > 0) pool = pool.filter((c) => c.bboChanges === most);
+  }
+
   return pool[Math.floor(random() * pool.length)] ?? null;
 }
 

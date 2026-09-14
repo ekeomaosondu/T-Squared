@@ -1,5 +1,11 @@
 import { MarketBook, type BookSide } from '@/src/book/book';
-import { Decimal, ONE, ZERO, canonicalPrice } from '@/src/book/decimal';
+import { Decimal, ZERO, canonicalPrice } from '@/src/book/decimal';
+import {
+  depthAhead,
+  publicLevelFor,
+  yesPriceOfPublicLevel,
+  type AheadDepth,
+} from '@/src/book/ladder';
 import type { LevelPair } from '@/src/book/hashing';
 import type {
   BookDeltaEvent,
@@ -69,6 +75,13 @@ export interface BookView {
   yesBidSizeAt(price: Decimal): Decimal;
   /** Resting size at a YES ask price, i.e. the NO bid at 1 - price. */
   yesAskSizeAt(price: Decimal): Decimal;
+  /**
+   * Depth ahead of an order on this ladder: better prices AND our own level.
+   *
+   * The `better` term is what a same-price-only model omits, and a probe that
+   * does not reprice accumulates it whenever the market improves past it.
+   */
+  depthAhead(side: 'bid' | 'ask', yesPrice: Decimal): AheadDepth;
   stateHash(): string;
 }
 
@@ -121,8 +134,9 @@ class MarketBookView implements BookView {
 
     const bid = bestBid?.[0] ?? null;
     const bidSize = bestBid?.[1] ?? null;
-    // The highest NO bid is the lowest YES ask: an ask at 1 - q.
-    const ask = bestNoBid === null ? null : ONE.minus(bestNoBid[0]);
+    // The highest NO bid is the lowest YES ask. Derived by the shared mapping.
+    const ask =
+      bestNoBid === null ? null : new Decimal(yesPriceOfPublicLevel('no', bestNoBid[0]));
     const askSize = bestNoBid?.[1] ?? null;
 
     // Both sides required; a one-sided book yields null rather than an
@@ -156,8 +170,13 @@ class MarketBookView implements BookView {
     return this.book.yesBids.get(canonicalPrice(price)) ?? ZERO;
   }
   yesAskSizeAt(price: Decimal): Decimal {
-    // A YES ask at p is physically a NO bid at 1 - p.
-    return this.book.noBids.get(canonicalPrice(ONE.minus(price))) ?? ZERO;
+    // A YES ask at p is physically a NO bid at 1 - p. Derived by the shared
+    // mapping rather than here, so the inversion exists in exactly one place.
+    return this.book.noBids.get(publicLevelFor('ask', price).price) ?? ZERO;
+  }
+
+  depthAhead(side: 'bid' | 'ask', yesPrice: Decimal): AheadDepth {
+    return depthAhead(side, yesPrice, { yesBids: this.book.yesBids, noBids: this.book.noBids });
   }
   stateHash(): string {
     return this.book.getStateHash();

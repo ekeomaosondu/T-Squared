@@ -20,6 +20,7 @@ import {
   modelAgreement,
   queueSteps,
 } from '@/src/research/calibration/analysis';
+import { auditQueueSemantics } from '@/src/research/calibration/queueAudit';
 import { logger } from '@/src/logging/logger';
 
 /**
@@ -302,6 +303,7 @@ async function run(args: Args): Promise<void> {
     cooldownMaxMs: CALIBRATION_DEFAULTS.cooldownMaxMs,
     expirationSlackMs: CALIBRATION_DEFAULTS.expirationSlackMs,
     dryRun,
+    preferChurn: args.bools.has('prefer-churn'),
     // Every historical fill model, evaluated on the same real orders. This is
     // the comparison the whole experiment exists to make possible.
     fillModels: ['touch', 'conservative_queue', 'queue_decay'].map((n) => makeFillModel(n)),
@@ -319,7 +321,12 @@ async function run(args: Args): Promise<void> {
   console.log(`  size        ${config.envelope.orderSize} contract, post-only, no repricing`);
   console.log(`  resting     max ${config.envelope.maxRestingOrders} total, ${config.envelope.maxRestingPerMarket} per market`);
   console.log(`  exposure    max $${config.envelope.maxWorstCaseExposureUsd} worst case`);
-  console.log(`  queue poll  every ${config.queuePollIntervalMs}ms, bulk endpoint\n`);
+  console.log(`  queue poll  every ${config.queuePollIntervalMs}ms, bulk endpoint`);
+  if (config.preferChurn) {
+    console.log('  selection   stratum rotation, ties broken toward a moving touch\n');
+  } else {
+    console.log('');
+  }
 
   const stop = () => {
     logger.warn({ event: 'calibration_interrupt' }, 'interrupt received; cancelling probes');
@@ -451,6 +458,100 @@ async function analyze(args: Args): Promise<void> {
   }
 }
 
+/**
+ * What does the exchange's queue position actually measure?
+ *
+ * Rebuilds the full ladder from the collector's own recorded deltas over each
+ * probe's life and asks which public quantity explains the reported moves:
+ * our own price level, better-priced depth, executed volume, or none of them.
+ */
+async function queueAudit(args: Args): Promise<void> {
+  const sql = db();
+  try {
+    const out = await auditQueueSemantics(sql, { runId: args.flags.get('run') });
+    const pad = (v: unknown, n: number) => String(v).padStart(n);
+    const pct = (n: number, d: number) => (d === 0 ? '   -' : `${((n / d) * 100).toFixed(0)}%`.padStart(4));
+
+    console.log('\n=== queue semantics audit ===\n');
+    console.log(`  probes audited                    ${out.probesAudited}`);
+    if (out.probesSkipped.length > 0) {
+      console.log(`  probes skipped                    ${out.probesSkipped.length}`);
+      const reasons = new Map<string, number>();
+      for (const s of out.probesSkipped) reasons.set(s.reason, (reasons.get(s.reason) ?? 0) + 1);
+      for (const [r, n] of reasons) console.log(`      ${n} x ${r}`);
+    }
+    console.log(`  queue transitions                 ${out.transitions}`);
+    console.log(`  nonzero reported moves            ${out.movingTransitions}\n`);
+
+    const m = out.movingTransitions;
+    for (const [label, key] of [
+      ['explained by public trades', 'TRADE_EXPLAINED'],
+      ['explained by better levels', 'BETTER_LEVEL_EXPLAINED'],
+      ['explained by same level', 'SAME_LEVEL_EXPLAINED'],
+      ['explained with lag adjustment', 'POSSIBLE_TIMING_ALIAS'],
+      ['still unexplained', 'STILL_UNEXPLAINED'],
+    ] as const) {
+      const n = out.byClass[key];
+      console.log(`  ${label.padEnd(34)}${pad(n, 5)}  ${pct(n, m)}`);
+    }
+
+    console.log('');
+    console.log(`  explained at ZERO lag             ${out.explainedAtZeroLag}  <- the null model`);
+    console.log(`  median inferred queue lag         ${out.medianLagMs ?? '-'} ms  (n=${out.lagSamples})`);
+    console.log(`  p90 inferred queue lag            ${out.p90LagMs ?? '-'} ms`);
+    if (out.lagHistogram.length > 0) {
+      console.log('  inferred lag histogram');
+      const peak = Math.max(...out.lagHistogram.map((h) => h.n));
+      for (const h of out.lagHistogram) {
+        console.log(
+          `    ${String(h.lagMs).padStart(6)}ms ${'#'.repeat(Math.round((h.n / peak) * 24))} ${h.n}`,
+        );
+      }
+      console.log(
+        '    A concentrated histogram means the endpoint is a lagged view. A flat one',
+      );
+      console.log(
+        '    means the search is finding coincidences and the readings are interval-censored.',
+      );
+    }
+    console.log('');
+    console.log(`  observations compared             ${out.observationsCompared}`);
+    console.log(
+      `  corr(reported Q, better+same)     ${out.correlationTotalAhead?.toFixed(3) ?? '-'}`,
+    );
+    console.log(
+      `  corr(reported Q, same level only) ${out.correlationSameOnly?.toFixed(3) ?? '-'}`,
+    );
+    console.log(
+      `  mean(reported Q - better depth)   ${out.meanResidualSameLevel?.toFixed(2) ?? '-'}   <- should look like a same-level queue`,
+    );
+
+    for (const s of out.splits) {
+      console.log(`\n  by ${s.dimension}`);
+      for (const b of s.buckets) {
+        console.log(
+          `    ${b.bucket.padEnd(16)}${pad(b.moves, 5)} moves, ${pad(b.unexplained, 4)} unexplained  ${pct(b.unexplained, b.moves)}`,
+        );
+      }
+    }
+
+    if (args.bools.has('rows')) {
+      console.log('\n  moving transitions');
+      for (const r of out.rows.filter((x) => Math.abs(x.deltaQ) >= 1)) {
+        console.log(
+          `    ${r.marketTicker.slice(-12)} ${r.side} dQ=${pad(r.deltaQ.toFixed(1), 8)} ` +
+            `dSame=${pad(r.deltaSame.toFixed(1), 8)} dBetter=${pad(r.deltaBetter.toFixed(1), 8)} ` +
+            `exec=${pad(r.executedAhead.toFixed(1), 6)} ticks=${r.ticksT0}->${r.ticksT1} ` +
+            `lag=${r.bestLagMs ?? '-'}ms  ${r.classification}`,
+        );
+      }
+    }
+    console.log('');
+  } finally {
+    await closeDb();
+  }
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   try {
@@ -461,6 +562,8 @@ async function main(): Promise<void> {
         return await run(args);
       case 'analyze':
         return await analyze(args);
+      case 'queue-audit':
+        return await queueAudit(args);
       default:
         console.log(
           [
@@ -469,6 +572,7 @@ async function main(): Promise<void> {
             '  preflight   verify every private endpoint and the feeds; place nothing',
             '  run         run the probe loop',
             '  analyze     read the dataset: latency, model agreement, queue movement',
+            '  queue-audit what queue_position_fp actually measures (--run, --rows)',
             '',
             'flags:',
             '  --dry-run                                    full loop, no orders sent',

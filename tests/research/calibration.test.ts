@@ -240,6 +240,7 @@ describe('calibration market selection', () => {
         stratum: { depth: 'high_depth', flow: 'high_flow' },
         mid: D('0.5'),
         touchDepth: D(900),
+        bboChanges: 40,
       },
       {
         marketTicker: 'THIN',
@@ -247,10 +248,41 @@ describe('calibration market selection', () => {
         stratum: { depth: 'low_depth', flow: 'low_flow' },
         mid: D('0.5'),
         touchDepth: D(10),
+        bboChanges: 1,
       },
     ];
     const sampled = new Map([['high_depth/high_flow', 12], ['low_depth/low_flow', 1]]);
     expect(selectNext(candidates, sampled, () => 0)!.marketTicker).toBe('THIN');
+  });
+
+  it('lets churn break a tie WITHIN a stratum, never override the rotation', () => {
+    const quiet: Candidate = {
+      marketTicker: 'QUIET',
+      seriesTicker: 'S',
+      stratum: { depth: 'low_depth', flow: 'low_flow' },
+      mid: D('0.5'),
+      touchDepth: D(10),
+      bboChanges: 0,
+    };
+    const busy: Candidate = { ...quiet, marketTicker: 'BUSY', bboChanges: 25 };
+    const other: Candidate = {
+      ...quiet,
+      marketTicker: 'OTHER_STRATUM',
+      stratum: { depth: 'high_depth', flow: 'high_flow' },
+      bboChanges: 999,
+    };
+
+    // Same stratum: churn decides.
+    expect(
+      selectNext([quiet, busy], new Map(), () => 0, { preferChurn: true })!.marketTicker,
+    ).toBe('BUSY');
+
+    // Different strata: rotation still wins, however busy the other one is.
+    // Trading one selection bias for another would defeat the stratification.
+    const sampled = new Map([['high_depth/high_flow', 0], ['low_depth/low_flow', 5]]);
+    expect(
+      selectNext([busy, other], sampled, () => 0, { preferChurn: true })!.marketTicker,
+    ).toBe('OTHER_STRATUM');
   });
 
   it('chooses a side by coin flip, not by expected fill', () => {

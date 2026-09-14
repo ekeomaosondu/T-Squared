@@ -36,6 +36,7 @@ export interface ProbeInsert {
   decisionImbalance1: Decimal | null;
   decisionImbalance3: Decimal | null;
   displayedSizeAtEntry: Decimal | null;
+  betterDepthAtEntry: Decimal | null;
   clientOrderId: string;
   orderSide: 'yes' | 'no';
   orderAction: 'buy' | 'sell';
@@ -104,7 +105,7 @@ export class CalibrationStore {
         decision_ts, decision_ts_ms, book_seq_at_decision, book_hash_at_decision,
         decision_bid, decision_ask, decision_bid_size, decision_ask_size,
         decision_mid, decision_imbalance_1, decision_imbalance_3,
-        displayed_size_at_entry,
+        displayed_size_at_entry, better_depth_at_entry,
         client_order_id, order_side, order_action, price_cents, yes_price, quantity,
         expiration_ts, terminal_state
       ) VALUES (
@@ -115,7 +116,7 @@ export class CalibrationStore {
         ${p.bookHashAtDecision},
         ${n(p.decisionBid)}, ${n(p.decisionAsk)}, ${n(p.decisionBidSize)}, ${n(p.decisionAskSize)},
         ${n(p.decisionMid)}, ${n(p.decisionImbalance1)}, ${n(p.decisionImbalance3)},
-        ${n(p.displayedSizeAtEntry)},
+        ${n(p.displayedSizeAtEntry)}, ${n(p.betterDepthAtEntry)},
         ${p.clientOrderId}, ${p.orderSide}, ${p.orderAction}, ${p.priceCents},
         ${p.yesPrice.toFixed(6)}, ${p.quantity}, ${p.expirationTs}, 'pending'
       )
@@ -245,20 +246,27 @@ export class CalibrationStore {
     cumRemoved: Decimal;
     cumAdded: Decimal;
     cumTrades: number;
+    betterDepth: Decimal | null;
+    betterLevels: number | null;
+    totalPublicAhead: Decimal | null;
+    ticksFromTouch: number | null;
   }): Promise<void> {
     await this.sql`
       INSERT INTO calibration_queue_observations (
         probe_id, seq_no, poll_send_ts_ms, poll_receive_ts_ms, time_since_entry_ms,
         queue_position, displayed_level_size, best_bid, best_ask,
         best_bid_size, best_ask_size, imbalance_1, imbalance_3,
-        cum_executed_at_price, cum_removed_at_price, cum_added_at_price, cum_trades_at_price
+        cum_executed_at_price, cum_removed_at_price, cum_added_at_price, cum_trades_at_price,
+        better_depth, better_levels, total_public_ahead, ticks_from_touch
       ) VALUES (
         ${args.probeId}, ${args.seqNo}, ${args.pollSendTsMs}, ${args.pollReceiveTsMs},
         ${args.timeSinceEntryMs}, ${args.queuePosition}, ${n(args.displayedLevelSize)},
         ${n(args.bestBid)}, ${n(args.bestAsk)}, ${n(args.bestBidSize)}, ${n(args.bestAskSize)},
         ${n(args.imbalance1)}, ${n(args.imbalance3)},
         ${args.cumExecuted.toFixed(6)}, ${args.cumRemoved.toFixed(6)},
-        ${args.cumAdded.toFixed(6)}, ${args.cumTrades}
+        ${args.cumAdded.toFixed(6)}, ${args.cumTrades},
+        ${n(args.betterDepth)}, ${args.betterLevels}, ${n(args.totalPublicAhead)},
+        ${args.ticksFromTouch}
       )
       ON CONFLICT (probe_id, seq_no) DO NOTHING
     `;
