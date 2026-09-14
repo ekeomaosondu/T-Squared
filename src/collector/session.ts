@@ -25,6 +25,7 @@ import { integrityRow, recordIntegrityEvent } from '@/src/persistence/repositori
 import { closeCaptureGap, openCaptureGap } from '@/src/persistence/repositories/captureGaps';
 import { loadEventLadders } from '@/src/persistence/repositories/metadata';
 import {
+  findLiveSessions,
   bumpSessionCounters,
   closeAllStreamsForSession,
   endSession,
@@ -252,8 +253,49 @@ export class SessionRunner extends EventEmitter {
   // Start / stop
   // -------------------------------------------------------------------------
 
+  /**
+   * Refuses to start while another collector is heartbeating.
+   *
+   * Two collectors on the same markets produce two sequence epochs that look
+   * individually valid and cannot afterwards be reconciled -- the books
+   * disagree and there is no principled way to choose between them. The
+   * database is the coordination point because it is the one thing both
+   * processes share, and a heartbeat check works regardless of connection
+   * pooling, where session-level advisory locks would not.
+   */
+  private async assertSoleCollector(): Promise<void> {
+    const live = await findLiveSessions(this.sql, this.env.COLLECTOR_HEARTBEAT_STALE_MS);
+    const others = live.filter((s) => s.session_id !== this.sessionId);
+    if (others.length === 0) return;
+
+    const detail = others
+      .map((s) => {
+        const ageMs = s.last_heartbeat_at ? Date.now() - s.last_heartbeat_at.getTime() : NaN;
+        return `${s.session_id} (${s.mode}, heartbeat ${Math.round(ageMs / 1000)}s ago)`;
+      })
+      .join(', ');
+
+    if (this.env.ALLOW_MULTIPLE_COLLECTORS) {
+      logger.error(
+        { event: 'multiple_collectors_allowed', others: others.map((s) => s.session_id) },
+        `another collector is live (${detail}); starting anyway because ALLOW_MULTIPLE_COLLECTORS=true`,
+      );
+      return;
+    }
+
+    throw new Error(
+      `refusing to start: another collector is already live -- ${detail}. ` +
+        'Two collectors double-subscribe the same markets and produce two sequence ' +
+        'epochs that cannot be reconciled. Stop the other one first, or wait ' +
+        `${Math.round(this.env.COLLECTOR_HEARTBEAT_STALE_MS / 1000)}s for its heartbeat to go stale. ` +
+        'Set ALLOW_MULTIPLE_COLLECTORS=true only if you genuinely intend to run two.',
+    );
+  }
+
   async start(): Promise<void> {
     this.startedAtMs = Date.now();
+
+    await this.assertSoleCollector();
 
     // Partitions must exist before a single raw event is written.
     await ensureRawPartitions(this.sql, this.env.RAW_PARTITION_AHEAD_DAYS);

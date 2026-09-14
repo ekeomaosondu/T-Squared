@@ -34,6 +34,15 @@ const EnvSchema = z.object({
 
   COLLECTOR_SOFT_RUNTIME_SECONDS: int(1440),
   COLLECTOR_HARD_RUNTIME_SECONDS: int(1680),
+  /**
+   * Permit a second collector to start while another is heartbeating.
+   *
+   * Off by default. Two collectors double-subscribe the same markets and
+   * produce two sequence epochs for them, which look individually valid and
+   * cannot afterwards be reconciled.
+   */
+  ALLOW_MULTIPLE_COLLECTORS: bool(false),
+
   COLLECTOR_HEARTBEAT_INTERVAL_MS: int(5000),
   COLLECTOR_HEARTBEAT_STALE_MS: int(20000),
 

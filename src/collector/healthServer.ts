@@ -65,6 +65,21 @@ export function startHealthServer(opts: {
       });
   });
 
+  // A bind failure on this host usually means another collector is already
+  // running here. Say so explicitly rather than dying with a bare EADDRINUSE.
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      logger.fatal(
+        { event: 'health_port_in_use', port: opts.port },
+        `port ${opts.port} is already in use -- another collector is probably running on this host. ` +
+          'Stop it first, or set HEALTH_PORT to a different port.',
+      );
+    } else {
+      logger.fatal({ event: 'health_server_failed', err: String(err) }, 'health server failed to start');
+    }
+    process.exit(1);
+  });
+
   server.listen(opts.port, '0.0.0.0', () => {
     logger.info({ event: 'health_server_started', port: opts.port }, `health endpoint on :${opts.port}`);
   });
