@@ -555,6 +555,26 @@ async function queueAudit(args: Args): Promise<void> {
     );
 
     const f = (v: number | null, dp = 2) => (v === null ? '   -' : v.toFixed(dp).padStart(8));
+
+    const ei = out.entryIdentity;
+    console.log('\n  --- the definitional test: reported queue vs displayed depth AT ENTRY ---\n');
+    console.log(`  probes with both               ${ei.probes}`);
+    console.log(
+      `  exact matches                  ${ei.exactMatches}  (${
+        ei.probes === 0 ? '-' : `${((ei.exactMatches / ei.probes) * 100).toFixed(0)}%`
+      })`,
+    );
+    console.log(`  behind the touch, exact        ${ei.behindTouchExact} of ${ei.behindTouchProbes}`);
+    console.log(`  mean gap                      ${f(ei.meanGap)}`);
+    console.log(`  median gap                    ${f(ei.medianGap)}`);
+    console.log(`  worst gap                     ${f(ei.maxAbsGap)}`);
+    console.log(
+      '\n  An exact match is stronger than any correlation: it says the endpoint IS',
+    );
+    console.log(
+      '  same-price displayed depth, so better-priced depth is not part of the',
+    );
+    console.log('  definition and beta is zero by construction rather than by regression.');
     console.log(`\n  --- H0 vs H1, on the book shifted back ${out.appliedLagMs}ms ---\n`);
     console.log(
       `  ${'hypothesis'.padEnd(22)}${'level MAE'.padStart(10)}${'bias'.padStart(9)}` +
@@ -573,6 +593,45 @@ async function queueAudit(args: Args): Promise<void> {
     console.log(
       '  help BEHIND the touch, the endpoint is same-price FIFO and beta belongs at zero.',
     );
+
+    console.log('\n  --- nested model gate (fitted on moves only) ---\n');
+    console.log(
+      `  ${'model'.padEnd(26)}${'n'.padStart(5)}${'alpha'.padStart(9)}${'beta'.padStart(9)}` +
+        `${'MAE'.padStart(9)}${'RMSE'.padStart(9)}${'hit'.padStart(7)}`,
+    );
+    for (const m of out.models) {
+      console.log(
+        `  ${m.model.padEnd(26)}${String(m.observations).padStart(5)}` +
+          `${m.alpha === null ? '        -' : f(m.alpha, 3).padStart(9)}` +
+          `${m.beta === null ? '        -' : f(m.beta, 3).padStart(9)}` +
+          `${f(m.mae)}${f(m.rmse)}` +
+          `${(m.hitRate === null ? '   -' : `${(m.hitRate * 100).toFixed(0)}%`).padStart(7)}`,
+      );
+    }
+    console.log(
+      '\n  Take the simplest model whose error is MATERIALLY better than the one below.',
+    );
+    console.log(
+      '  A near-zero alpha or beta that does not reduce the error is evidence the term',
+    );
+    console.log('  does not belong, not a reason to keep it because theory says it should.');
+
+    console.log('\n  --- how a fill model should track the queue ---\n');
+    console.log(
+      `  ${'estimator'.padEnd(14)}${'n'.padStart(7)}${'MAE'.padStart(9)}${'bias'.padStart(9)}${'terminal MAE'.padStart(14)}`,
+    );
+    for (const l of out.levelModels) {
+      console.log(
+        `  ${l.model.padEnd(14)}${String(l.observations).padStart(7)}${f(l.mae)}${f(l.bias)}${f(l.terminalMae).padStart(14)}`,
+      );
+    }
+    console.log(
+      '\n  INTEGRATED anchors once at entry and decrements by executions, as the current',
+    );
+    console.log(
+      '  fill models do. REANCHORED re-reads same-price displayed depth every step. The',
+    );
+    console.log('  terminal column is where accumulated drift shows up.');
 
     console.log('\n  --- by regime ---\n');
     console.log(

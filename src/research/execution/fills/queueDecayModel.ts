@@ -57,6 +57,10 @@ export class QueueDecayModel extends QueueFillModel {
       cancelCreditRatio: D(this.params.cancelCreditRatio).toString(),
       decayPerSecond: this.decayPerSecond.toString(),
       calibrated: false,
+      calibrationNote:
+        'the queue-ahead ANCHOR is now measured (see conservative_queue), but these ' +
+        'decay parameters are not: every step-wise model of queue advance scored a ' +
+        '2-6% hit rate on calibration v0, so nothing was fitted',
     };
   }
 

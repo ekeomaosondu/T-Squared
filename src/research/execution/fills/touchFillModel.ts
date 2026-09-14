@@ -19,6 +19,18 @@ export class TouchFillModel extends QueueFillModel {
   }
 
   describe(): Record<string, unknown> {
-    return { model: 'touch', queueAheadFraction: '0', cancelCreditRatio: '1' };
+    return {
+      model: 'touch',
+      queueAheadFraction: '0',
+      cancelCreditRatio: '1',
+      calibration: {
+        // Measured against real probes and found badly wrong, which is exactly
+        // what a ceiling is for.
+        queueAheadAtEntry: 'refuted',
+        evidence:
+          'understates the exchange-reported queue at entry by ~46 contracts on average; ' +
+          '3 false-positive fills in 53 probes and an 8.9s fill-time error',
+      },
+    };
   }
 }

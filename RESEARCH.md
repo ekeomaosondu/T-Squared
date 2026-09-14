@@ -531,7 +531,78 @@ from the exchange at startup, not from process memory. Book invalid, private
 feed down, persistence failing, an ambiguous order or any risk breach stops new
 probes; a breach never crosses the spread to flatten.
 
-### What `queue_position_fp` actually measures
+### What `queue_position_fp` measures — settled
+
+`npm run calibrate -- queue-audit` rebuilds the **full ladder** from the
+collector's own recorded deltas over each probe's life and tests two explicit
+readings of the endpoint:
+
+```
+H0   queue position is the same-price FIFO queue
+H1   queue position is everything ahead under price priority,
+     so better-priced depth counts too
+```
+
+**The definitional test settles it.** At the instant of entry, before anything
+can drift, the exchange's reported queue is compared against the same-price
+displayed depth computed from the public feed:
+
+```
+probes with both readings        67
+exact matches                    62   (93%)
+behind the touch, exact          27 of 28
+median gap                     0.00 contracts
+```
+
+`queue_position_fp` **is** same-price displayed depth. Not "fits better" —
+equal, to a hundredth of a contract, across sizes from 2.67 to 115.27. The five
+misses are consistent with the endpoint's measured 400–800 ms lag catching a
+level that changed between placement and the first reading.
+
+H1 was tested where it could actually differ — 4,367 observations resting one
+and two ticks behind the touch, produced by a deliberate behind-the-touch
+experiment rather than by drift:
+
+```
+hypothesis          level MAE     bias     corr
+H0 same-price FIFO       9.26    -9.24    0.830
+H1 price priority      119.92  -119.92    0.708
+
+by regime            obs    H0 MAE   H1 MAE
+1_TICK_BEHIND       1996      4.61   103.88
+2_TICKS_BEHIND      2371     12.54   136.13
+```
+
+H1 is 13× worse and overstates the queue by 120 contracts. **β = 0, by
+measurement.**
+
+#### What is still not established
+
+Every step-wise model of how the queue *advances* failed:
+
+```
+model                          n    alpha    beta     MAE    hit
+A  executions only            48        -       -   19.02     2%
+B  + alpha cancellations      48    1.090       -   17.14     4%
+C  + beta better depth        48    1.090  -0.333   16.09     6%
+```
+
+Hit rates of 2–6% against a one-contract tolerance. Nothing was fitted on that
+basis. α = 0 is **uncontradicted** — same-price cancellations run at ~0.5
+contracts per sample while the queue almost never moves — but it is not
+identified, and the model's manifest says so rather than claiming otherwise.
+
+Re-anchoring to displayed depth each step versus integrating from entry made no
+material difference (MAE 7.87 vs 8.25), so the existing implementation stands.
+
+#### Consequence
+
+`conservative_queue` is promoted from assumption to **measured**: its
+queue-ahead anchor is exactly what the exchange reports. Its decay rule remains
+merely un-refuted, and the gap between those two claims is deliberate and
+recorded in `describe()`.
+
+### Earlier: the at-the-touch pilot
 
 The first run left 20 of 24 queue moves unexplained against a same-price
 model. `npm run calibrate -- queue-audit` rebuilds the **full ladder** from the

@@ -163,6 +163,12 @@ export interface AuditResult {
   rows: Transition[];
   /** H0 against H1, on the lag-adjusted book. See HypothesisComparison. */
   hypotheses: HypothesisComparison[];
+  /** The nested model gate. See QueueModelFit. */
+  models: QueueModelFit[];
+  /** How a fill model should TRACK the queue. See LevelTrackingFit. */
+  levelModels: LevelTrackingFit[];
+  /** The definitional test. See EntryIdentity. */
+  entryIdentity: EntryIdentity;
   /** Transitions by how far behind the touch the probe was sitting. */
   byRegime: RegimeBreakdown[];
   appliedLagMs: number;
@@ -200,6 +206,83 @@ export interface HypothesisComparison {
   moves: number;
   /** MAE of the predicted CHANGE, which is what a fill model consumes. */
   deltaMae: number | null;
+}
+
+/**
+ * A candidate model for how the queue advances, and how well it did.
+ *
+ *     A   dQ = V_executed
+ *     B   dQ = V_executed + alpha * C_same
+ *     C   dQ = V_executed + alpha * C_same + beta * dD_better
+ *
+ * Nested on purpose, and read from the bottom up: take the simplest model
+ * whose error is MATERIALLY better than the one below it. `beta` is kept
+ * separate from `alpha` because they answer different questions -- alpha is how
+ * much of a same-level cancellation was ahead of us, beta is whether
+ * better-priced depth counts at all -- and letting better-priced depth leak
+ * into alpha would corrupt the one parameter we have evidence for.
+ *
+ * Fitted by ordinary least squares on the residual after executed volume,
+ * which is exact and has no tuning of its own. A flexible fit would do better
+ * on these samples and mean less.
+ */
+export interface QueueModelFit {
+  model: 'A_executions' | 'B_alpha_cancellations' | 'C_plus_better_depth';
+  observations: number;
+  alpha: number | null;
+  beta: number | null;
+  mae: number | null;
+  rmse: number | null;
+  /** Share of moves predicted within tolerance. */
+  hitRate: number | null;
+}
+
+/**
+ * How a fill model should carry queue-ahead through a resting order's life.
+ *
+ * The delta gate above asks what moves the queue. This asks something more
+ * useful and more answerable: given the public book, what is the best estimate
+ * of the queue RIGHT NOW?
+ *
+ *   INTEGRATED    the current implementation. Anchor to displayed size at
+ *                 entry, then decrement by observed executions. Errors
+ *                 accumulate and are never corrected.
+ *   REANCHORED    read same-price displayed depth from the book at every step.
+ *                 Cannot drift, because it never carries state forward.
+ *
+ * The distinction matters because a simulated order rests for minutes. An
+ * estimator that is unbiased per step but never re-reads the book will still
+ * be far wrong by the end.
+ */
+export interface LevelTrackingFit {
+  model: 'INTEGRATED' | 'REANCHORED';
+  observations: number;
+  mae: number | null;
+  bias: number | null;
+  /** Error on the LAST reading of each probe, where drift has accumulated. */
+  terminalMae: number | null;
+}
+
+/**
+ * The definitional test, at the one instant where nothing has had time to
+ * drift: does the exchange's reported queue EQUAL the same-price displayed
+ * depth we computed from the public feed?
+ *
+ * Everything else in this module compares hypotheses on error and correlation,
+ * which can only ever say one reading fits better. This can say the reading is
+ * exact -- and if it is, no amount of better-priced depth belongs in the
+ * definition and beta is zero by construction rather than by regression.
+ */
+export interface EntryIdentity {
+  probes: number;
+  /** Probes where the two agree to within a hundredth of a contract. */
+  exactMatches: number;
+  meanGap: number | null;
+  medianGap: number | null;
+  maxAbsGap: number | null;
+  /** The same test restricted to probes that rested behind the touch. */
+  behindTouchProbes: number;
+  behindTouchExact: number;
 }
 
 export interface RegimeBreakdown {
@@ -675,6 +758,152 @@ export async function auditQueueSemantics(
     })
     .filter((r) => r.transitions > 0);
 
+  // ---- the nested model gate --------------------------------------------
+  //
+  // Fitted only on moves, and only where the book was reconstructable. A model
+  // of how the queue ADVANCES has nothing to learn from intervals in which it
+  // did not move, and including them would let a model that predicts zero
+  // everywhere look excellent.
+  const fitRows = rows.filter((r) => Math.abs(r.deltaQ) >= EXPLAINED_TOLERANCE);
+  const y = fitRows.map((r) => r.deltaQ - r.executedAhead);
+  const cSame = fitRows.map((r) => r.deltaSame);
+  const dBetter = fitRows.map((r) => r.deltaBetter);
+
+  /** Least squares through the origin, one or two regressors. */
+  const ols = (regressors: number[][]): number[] | null => {
+    const k = regressors.length;
+    if (k === 0 || y.length < k + 2) return null;
+    if (k === 1) {
+      const x = regressors[0]!;
+      const den = x.reduce((a, v) => a + v * v, 0);
+      if (den === 0) return null;
+      return [x.reduce((a, v, i) => a + v * y[i]!, 0) / den];
+    }
+    // Two regressors: solve the 2x2 normal equations directly.
+    const [x1, x2] = regressors as [number[], number[]];
+    const s11 = x1.reduce((a, v) => a + v * v, 0);
+    const s22 = x2.reduce((a, v) => a + v * v, 0);
+    const s12 = x1.reduce((a, v, i) => a + v * x2[i]!, 0);
+    const s1y = x1.reduce((a, v, i) => a + v * y[i]!, 0);
+    const s2y = x2.reduce((a, v, i) => a + v * y[i]!, 0);
+    const det = s11 * s22 - s12 * s12;
+    if (Math.abs(det) < 1e-9) return null;
+    return [(s1y * s22 - s2y * s12) / det, (s2y * s11 - s1y * s12) / det];
+  };
+
+  const scoreModel = (
+    model: QueueModelFit['model'],
+    alpha: number | null,
+    beta: number | null,
+  ): QueueModelFit => {
+    const errors = fitRows.map((r, i) => {
+      const predicted =
+        r.executedAhead + (alpha ?? 0) * cSame[i]! + (beta ?? 0) * dBetter[i]!;
+      return r.deltaQ - predicted;
+    });
+    const n = errors.length;
+    return {
+      model,
+      observations: n,
+      alpha,
+      beta,
+      mae: n === 0 ? null : errors.reduce((a, e) => a + Math.abs(e), 0) / n,
+      rmse: n === 0 ? null : Math.sqrt(errors.reduce((a, e) => a + e * e, 0) / n),
+      hitRate:
+        n === 0 ? null : errors.filter((e) => Math.abs(e) < EXPLAINED_TOLERANCE).length / n,
+    };
+  };
+
+  const alphaOnly = ols([cSame]);
+  const both = ols([cSame, dBetter]);
+  const models: QueueModelFit[] = [
+    scoreModel('A_executions', null, null),
+    scoreModel('B_alpha_cancellations', alphaOnly?.[0] ?? null, null),
+    scoreModel('C_plus_better_depth', both?.[0] ?? null, both?.[1] ?? null),
+  ];
+
+  // ---- how should a fill model TRACK the queue? -------------------------
+  //
+  // Both estimators are run forward over each probe's own sequence of
+  // readings and scored against what the exchange reported. This is the
+  // question the fill model actually needs answered.
+  const byProbe = new Map<string, Transition[]>();
+  for (const r of rows) {
+    const list = byProbe.get(r.probeId) ?? [];
+    list.push(r);
+    byProbe.set(r.probeId, list);
+  }
+
+  const integratedErrors: number[] = [];
+  const reanchoredErrors: number[] = [];
+  const integratedTerminal: number[] = [];
+  const reanchoredTerminal: number[] = [];
+
+  for (const seq of byProbe.values()) {
+    seq.sort((a, b) => a.t0Ms - b.t0Ms);
+    // Anchored once, at the first reading, exactly as the live model does.
+    let integrated = seq[0]!.sameT0;
+    for (const [i, r] of seq.entries()) {
+      integrated = Math.max(0, integrated - r.executedAhead);
+      const reanchored = r.sameT1;
+      const eInt = r.q1 - integrated;
+      const eRe = r.q1 - reanchored;
+      integratedErrors.push(eInt);
+      reanchoredErrors.push(eRe);
+      if (i === seq.length - 1) {
+        integratedTerminal.push(eInt);
+        reanchoredTerminal.push(eRe);
+      }
+    }
+  }
+
+  const meanAbs = (xs: readonly number[]) =>
+    xs.length === 0 ? null : xs.reduce((a, v) => a + Math.abs(v), 0) / xs.length;
+  const meanSigned = (xs: readonly number[]) =>
+    xs.length === 0 ? null : xs.reduce((a, v) => a + v, 0) / xs.length;
+
+  const levelModels: LevelTrackingFit[] = [
+    {
+      model: 'INTEGRATED',
+      observations: integratedErrors.length,
+      mae: meanAbs(integratedErrors),
+      bias: meanSigned(integratedErrors),
+      terminalMae: meanAbs(integratedTerminal),
+    },
+    {
+      model: 'REANCHORED',
+      observations: reanchoredErrors.length,
+      mae: meanAbs(reanchoredErrors),
+      bias: meanSigned(reanchoredErrors),
+      terminalMae: meanAbs(reanchoredTerminal),
+    },
+  ];
+
+  // ---- the definitional test --------------------------------------------
+  const entryRows = (await sql`
+    SELECT p.displayed_size_at_entry AS displayed,
+           p.initial_queue_position AS q0,
+           p.better_depth_at_entry AS better
+      FROM calibration_probes p
+     WHERE p.initial_queue_position IS NOT NULL
+       AND p.displayed_size_at_entry IS NOT NULL ${scope}
+  `) as unknown as { displayed: string; q0: string; better: string | null }[];
+
+  const gaps = entryRows.map((r) => Number(r.displayed) - Number(r.q0));
+  const sortedGaps = [...gaps].sort((a, b) => a - b);
+  const behind = entryRows.filter((r) => r.better !== null && Number(r.better) > 0);
+  const entryIdentity: EntryIdentity = {
+    probes: gaps.length,
+    exactMatches: gaps.filter((g) => Math.abs(g) < 0.01).length,
+    meanGap: gaps.length === 0 ? null : gaps.reduce((a, g) => a + g, 0) / gaps.length,
+    medianGap: percentile(sortedGaps, 0.5),
+    maxAbsGap: gaps.length === 0 ? null : Math.max(...gaps.map(Math.abs)),
+    behindTouchProbes: behind.length,
+    behindTouchExact: behind.filter(
+      (r) => Math.abs(Number(r.displayed) - Number(r.q0)) < 0.01,
+    ).length,
+  };
+
   const sortedLags = [...lagSamples].sort((a, b) => a - b);
   const histogram = new Map<number, number>();
   for (const l of sortedLags) histogram.set(l, (histogram.get(l) ?? 0) + 1);
@@ -710,6 +939,9 @@ export async function auditQueueSemantics(
     probesSkipped: skipped,
     rows,
     hypotheses,
+    models,
+    levelModels,
+    entryIdentity,
     byRegime,
     appliedLagMs: appliedLag,
   };

@@ -128,3 +128,34 @@ describe('queue decay model', () => {
     expect(new QueueDecayModel().describe().calibrated).toBe(false);
   });
 });
+
+describe('calibration provenance', () => {
+  it('records that the conservative anchor is MEASURED, not assumed', () => {
+    // The claim in the manifest has to match what was actually established.
+    // Calibration v0 matched the exchange's own queue exactly at entry in 62
+    // of 67 probes, so this is a measurement and the manifest should say so.
+    const c = new ConservativeQueueModel().describe().calibration as Record<string, unknown>;
+    expect(c.queueAheadAtEntry).toBe('validated');
+    expect(String(c.evidence)).toMatch(/67/);
+    expect(String(c.betterPriceDepth)).toMatch(/excluded by measurement/);
+  });
+
+  it('does NOT claim the cancellation credit was identified', () => {
+    // alpha = 0 is uncontradicted, not measured. Every step-wise model of
+    // queue advance failed on this data, so nothing was fitted, and the
+    // manifest must not imply otherwise.
+    const c = new ConservativeQueueModel().describe().calibration as Record<string, unknown>;
+    expect(String(c.cancelCreditRatio)).toMatch(/not identified/);
+  });
+
+  it('records that touch was refuted rather than merely optimistic', () => {
+    const c = new TouchFillModel().describe().calibration as Record<string, unknown>;
+    expect(c.queueAheadAtEntry).toBe('refuted');
+  });
+
+  it('keeps queue_decay marked uncalibrated', () => {
+    const d = new QueueDecayModel().describe();
+    expect(d.calibrated).toBe(false);
+    expect(String(d.calibrationNote)).toMatch(/not/);
+  });
+});
