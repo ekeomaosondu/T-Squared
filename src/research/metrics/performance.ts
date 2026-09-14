@@ -59,6 +59,9 @@ export interface RunSummary {
     netPnl: string | null;
     realizedPnl: string;
     unrealizedPnl: string | null;
+    /** Open positions with no mark. Excluded from the figures above. */
+    unmarkedPositions: number;
+    unmarkedQuantity: string;
     pnlPerDay: string | null;
     pnlPerMarket: string | null;
     pnlPerEvent: string | null;
@@ -176,6 +179,8 @@ export function summarizeRun(
         maxDrawdown: result.portfolio.maxDrawdown.toFixed(6),
         finalAbsInventory: finalAbs.toFixed(6),
         finalPositionsOpen: openPositions,
+        unmarkedPositions: last?.unmarkedPositions ?? 0,
+        unmarkedQuantity: last?.unmarkedQuantity ?? '0',
       },
 
       inventory: {

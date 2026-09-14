@@ -22,9 +22,11 @@ export interface BucketStats {
   fees: string;
   /** Mean half-spread captured, dollars per contract. */
   spreadCaptured: string | null;
-  /** Mean markout at the summary horizon, dollars per contract. */
+  /** Mean total markout at the summary horizon, dollars per contract. */
   markout: string | null;
-  /** Share of fills with a negative markout at the summary horizon. */
+  /** Mean mid drift at the summary horizon, with the half-spread removed. */
+  midDrift: string | null;
+  /** Share of fills the market moved against, measured on the drift. */
   adverseRate: string | null;
 }
 
@@ -45,6 +47,8 @@ interface Accumulator {
   spreadObs: number;
   markoutSum: Decimal;
   markoutObs: number;
+  driftSum: Decimal;
+  driftObs: number;
   adverse: number;
 }
 
@@ -57,6 +61,8 @@ const emptyAcc = (): Accumulator => ({
   spreadObs: 0,
   markoutSum: ZERO,
   markoutObs: 0,
+  driftSum: ZERO,
+  driftObs: 0,
   adverse: 0,
 });
 
@@ -166,11 +172,17 @@ export function computeBreakdowns(
         a.spreadObs += 1;
       }
 
-      const value = markoutByFill.get(fill.fillId)?.markouts[key];
+      const record = markoutByFill.get(fill.fillId);
+      const value = record?.markouts[key];
       if (value !== null && value !== undefined) {
-        const d = new Decimal(value);
-        a.markoutSum = a.markoutSum.plus(d);
+        a.markoutSum = a.markoutSum.plus(new Decimal(value));
         a.markoutObs += 1;
+      }
+      const drift = record?.midDrift[key];
+      if (drift !== null && drift !== undefined) {
+        const d = new Decimal(drift);
+        a.driftSum = a.driftSum.plus(d);
+        a.driftObs += 1;
         if (d.isNegative()) a.adverse += 1;
       }
     }
@@ -184,8 +196,8 @@ export function computeBreakdowns(
         fees: a.fees.toFixed(6),
         spreadCaptured: a.spreadObs === 0 ? null : a.spreadSum.div(a.spreadObs).toFixed(8),
         markout: a.markoutObs === 0 ? null : a.markoutSum.div(a.markoutObs).toFixed(8),
-        adverseRate:
-          a.markoutObs === 0 ? null : new Decimal(a.adverse).div(a.markoutObs).toFixed(6),
+        midDrift: a.driftObs === 0 ? null : a.driftSum.div(a.driftObs).toFixed(8),
+        adverseRate: a.driftObs === 0 ? null : new Decimal(a.adverse).div(a.driftObs).toFixed(6),
       }))
       .sort((x, y) => (x.bucket < y.bucket ? -1 : x.bucket > y.bucket ? 1 : 0));
 

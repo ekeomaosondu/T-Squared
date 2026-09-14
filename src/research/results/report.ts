@@ -16,8 +16,12 @@ import type { CompletedRun } from '@/src/research/engine/runBacktest';
 
 const pad = (s: string, n: number) => s.padEnd(n);
 const rpad = (s: string, n: number) => s.padStart(n);
-const money = (v: string | null) => (v === null ? '     n/a' : new Decimal(v).toFixed(2));
-const cents = (v: string | null) => (v === null ? '   n/a' : new Decimal(v).mul(100).toFixed(3));
+const money = (v: string | null | undefined) =>
+  v === null || v === undefined ? 'n/a' : new Decimal(v).toFixed(2);
+const cents = (v: string | null | undefined) =>
+  v === null || v === undefined ? 'n/a' : new Decimal(v).mul(100).toFixed(3);
+const rate = (v: string | null | undefined) =>
+  v === null || v === undefined ? 'n/a' : new Decimal(v).toFixed(3);
 
 export function renderRun(manifest: RunManifest, summary: RunSummary): string {
   const lines: string[] = [];
@@ -68,14 +72,27 @@ export function renderRun(manifest: RunManifest, summary: RunSummary): string {
   lines.push('');
 
   lines.push('  markouts (cents per contract, positive = favourable)');
-  lines.push(`    ${pad('horizon', 10)}${rpad('mean', 10)}${rpad('median', 10)}${rpad('adverse', 10)}${rpad('n', 8)}${rpad('unobs', 8)}`);
+  lines.push(
+    `    ${pad('horizon', 10)}${rpad('markout', 10)}${rpad('median', 10)}` +
+      `${rpad('drift', 10)}${rpad('adverse', 9)}${rpad('n', 8)}${rpad('unobs', 8)}`,
+  );
   for (const m of summary.markouts) {
     lines.push(
       `    ${pad(`${m.horizonMs}ms`, 10)}${rpad(cents(m.meanMarkout), 10)}` +
-        `${rpad(cents(m.medianMarkout), 10)}${rpad(m.adverseRate ?? 'n/a', 10)}` +
+        `${rpad(cents(m.medianMarkout), 10)}${rpad(cents(m.meanMidDrift), 10)}` +
+        `${rpad(rate(m.adverseRate), 9)}` +
         `${rpad(String(m.observations), 8)}${rpad(String(m.unobserved), 8)}`,
     );
   }
+  lines.push(
+    '    markout is measured from the FILL PRICE and therefore includes the half-spread a',
+  );
+  lines.push(
+    '    maker earns by construction. drift removes it: it is the same measurement from the',
+  );
+  lines.push(
+    '    mid at the fill, and it is the one that says whether we were picked off.',
+  );
   lines.push('');
 
   const p = summary.pnl;
@@ -93,6 +110,13 @@ export function renderRun(manifest: RunManifest, summary: RunSummary): string {
       `  NOTE              ${new Decimal(p.finalAbsInventory).toFixed(1)} contracts still open across ` +
         `${p.finalPositionsOpen} market(s); that part of net PnL is a mark, not a result. ` +
         'Phase 1 does not settle -- the lake carries no lifecycle events.',
+    );
+  }
+  if (p.unmarkedPositions > 0) {
+    lines.push(
+      `  NOTE              ${p.unmarkedPositions} open position(s), ` +
+        `${new Decimal(p.unmarkedQuantity).toFixed(1)} contracts, have NO mark (one-sided book) ` +
+        'and are excluded from the PnL above rather than priced at a guess.',
     );
   }
   lines.push('');
@@ -117,34 +141,36 @@ export function renderComparison(runs: readonly CompletedRun[]): string {
   const header = [
     pad('strategy', 22),
     pad('fill', 20),
-    rpad('lat', 6),
-    rpad('fills', 8),
+    rpad('lat', 5),
+    rpad('fills', 7),
     rpad('rate', 7),
     rpad('spr(c)', 8),
-    rpad('mk100', 8),
     rpad('mk1s', 8),
-    rpad('mk30s', 8),
+    rpad('dr100', 8),
+    rpad('dr1s', 8),
+    rpad('dr30s', 8),
     rpad('adv', 7),
     rpad('mean|q|', 9),
     rpad('max|q|', 8),
     rpad('net$', 10),
-    rpad('fees$', 9),
+    rpad('fees$', 8),
   ].join('');
 
   const rows = runs.map((run) => {
     const s = run.summary;
-    const m = (h: number) => cents(s.markouts.find((x) => x.horizonMs === h)?.meanMarkout ?? null);
+    const at = (h: number) => s.markouts.find((x) => x.horizonMs === h);
     return [
       pad(run.manifest.strategyName, 22),
       pad(run.manifest.fillModel, 20),
-      rpad(String((run.manifest.latencyModel.marketDataMs as number | undefined) ?? 0), 6),
-      rpad(String(s.execution.fills), 8),
+      rpad(String((run.manifest.latencyModel.marketDataMs as number | undefined) ?? 0), 5),
+      rpad(String(s.execution.fills), 7),
       rpad(new Decimal(s.execution.fillRate).toFixed(3), 7),
       rpad(cents(s.execution.averageSpreadCaptured), 8),
-      rpad(m(100), 8),
-      rpad(m(1_000), 8),
-      rpad(m(30_000), 8),
-      rpad(s.adverseSelectionRate ?? 'n/a', 7),
+      rpad(cents(at(1_000)?.meanMarkout), 8),
+      rpad(cents(at(100)?.meanMidDrift), 8),
+      rpad(cents(at(1_000)?.meanMidDrift), 8),
+      rpad(cents(at(30_000)?.meanMidDrift), 8),
+      rpad(rate(s.adverseSelectionRate), 7),
       rpad(
         s.inventory.meanAbsInventory === null
           ? 'n/a'
@@ -153,7 +179,7 @@ export function renderComparison(runs: readonly CompletedRun[]): string {
       ),
       rpad(new Decimal(s.inventory.maxAbsInventory).toFixed(0), 8),
       rpad(money(s.pnl.netPnl), 10),
-      rpad(money(s.pnl.fees), 9),
+      rpad(money(s.pnl.fees), 8),
     ].join('');
   });
 
@@ -168,8 +194,12 @@ export function renderComparison(runs: readonly CompletedRun[]): string {
     '-'.repeat(header.length),
     ...rows,
     '',
-    `columns: spr = mean half-spread captured per maker fill; mkNN = mean markout at that horizon,`,
-    `         in cents per contract, positive = favourable; adv = share of fills with a negative 1s markout.`,
+    'columns, all in cents per contract, positive = favourable:',
+    '  spr    mean half-spread captured per maker fill',
+    '  mk1s   total markout at 1s, from the fill price -- includes spr by construction',
+    '  drNN   mid DRIFT at that horizon, i.e. the same measurement with spr removed.',
+    '         This is the adverse-selection column. mk minus spr should equal dr.',
+    '  adv    share of fills the mid moved against within 1s',
     '',
     equality.length === 0
       ? 'book NOT verified: no recorded checkpoints in this window.'
@@ -179,7 +209,10 @@ export function renderComparison(runs: readonly CompletedRun[]): string {
     '',
     'Absolute PnL is NOT a prediction of live performance. The queue model is not yet',
     'calibrated against real fills, so the fill count -- and everything downstream of it --',
-    'is a modelling assumption. Read the relative ordering and the markouts.',
+    'is a modelling assumption. Read the relative ordering and the drift columns.',
+    '',
+    'net$ also carries end-of-window inventory marked at the last mid, because Phase 1',
+    'does not settle. Where mean|q| is large, net$ is mostly that mark.',
     '',
   ].join('\n');
 }

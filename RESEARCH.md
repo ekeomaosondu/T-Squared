@@ -235,6 +235,14 @@ sold   YES at p, mid later m  ->  p - m
 Computed entirely after the run, from a recorded mid series, so the future is
 structurally unreachable from strategy state.
 
+**Two columns, and the difference matters.** `markout` is measured from the
+fill price, so it includes the half-spread a maker earns by construction — the
+mid is above the bid, so buying at the bid has a positive markout before the
+market does anything at all. `drift` is the same measurement from the *mid at
+the fill*, with that half-spread removed, and it is the one that answers "were
+we picked off". Adverse selection is a statement about `drift`; `markout` minus
+`spread captured` should equal it.
+
 These are the most trustworthy numbers the platform produces at Phase 1,
 because they depend only on the fill time and price the simulator chose and on
 the recorded mid afterwards — not on the queue model, the fee schedule or the
@@ -263,6 +271,12 @@ Equity assumptions do not transfer:
   `collateralRequired` is what capital is actually tied up
 
 Settlement is explicit and terminal, never "mark at the last mid".
+
+A position with no mark — a one-sided book has no mid, and across two dozen
+strikes at least one is one-sided most of the time — is **excluded** from the
+PnL and counted separately as `unmarkedPositions`. Letting a single unpriceable
+position null the total made the headline figure unavailable in almost every
+run; pricing it at a guess would be worse.
 
 **Phase 1 does not settle**, because the silver lake carries no lifecycle
 events. Open positions are marked at the last mid and the summary says so

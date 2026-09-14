@@ -43,10 +43,24 @@ export interface FillMarkout {
   quantity: string;
   referencePrice: string | null;
   reference: MarkoutReference;
-  /** Per-horizon, sign-normalized so POSITIVE is always favourable. */
+  /**
+   * Total markout from the FILL PRICE, sign-normalized so positive is
+   * favourable. This is the whole edge: the half-spread captured plus whatever
+   * the market did afterwards.
+   */
   markouts: Record<string, string | null>;
   /** Per-horizon markout in dollars, i.e. markout * quantity. */
   markoutDollars: Record<string, string | null>;
+  /**
+   * Drift of the reference price from the fill instant, sign-normalized.
+   *
+   * The SAME measurement with the half-spread removed, and the one that
+   * actually answers "were we picked off". A maker buying at the bid has a
+   * markout of at least half the spread by construction -- the mid is above
+   * the bid -- so a healthy-looking total markout can hide a market that ran
+   * away from every fill. Adverse selection is a statement about this column.
+   */
+  midDrift: Record<string, string | null>;
 }
 
 function referenceAt(series: MidSeries, atMs: number, reference: MarkoutReference): Decimal | null {
@@ -89,15 +103,18 @@ export function computeMarkouts(
 
     const markouts: Record<string, string | null> = {};
     const markoutDollars: Record<string, string | null> = {};
+    const midDrift: Record<string, string | null> = {};
 
     const ref = s ? referenceAt(s, filledAt, reference) : null;
 
     for (const h of horizons) {
       const future = s ? referenceAt(s, filledAt + h, reference) : null;
       const m = markoutOf(fill.yesAction, fill.yesPrice, future);
+      const drift = ref === null ? null : markoutOf(fill.yesAction, ref, future);
       const key = String(h);
       markouts[key] = m === null ? null : m.toFixed(6);
       markoutDollars[key] = m === null ? null : m.mul(fill.quantity).toFixed(6);
+      midDrift[key] = drift === null ? null : drift.toFixed(6);
     }
 
     out.push({
@@ -114,6 +131,7 @@ export function computeMarkouts(
       reference,
       markouts,
       markoutDollars,
+      midDrift,
     });
   }
 
@@ -129,7 +147,15 @@ export interface MarkoutSummary {
   meanMarkout: string | null;
   medianMarkout: string | null;
   totalMarkoutDollars: string | null;
-  /** Share of observations with a strictly negative markout. */
+  /** Mean reference-price drift, with the half-spread removed. */
+  meanMidDrift: string | null;
+  /**
+   * Share of observations the market moved AGAINST, measured on the drift.
+   *
+   * Deliberately not on the total markout: that includes the half-spread a
+   * maker earns by construction, so it reports a comfortable-looking rate even
+   * when the mid runs away from every single fill.
+   */
   adverseRate: string | null;
 }
 
@@ -141,6 +167,8 @@ export function summarizeMarkouts(
     const key = String(h);
     const values: Decimal[] = [];
     let dollars = new Decimal(0);
+    let driftSum = new Decimal(0);
+    let driftObs = 0;
     let unobserved = 0;
     let adverse = 0;
 
@@ -153,10 +181,16 @@ export function summarizeMarkouts(
         unobserved += 1;
         continue;
       }
-      const d = new Decimal(v);
-      values.push(d);
-      if (d.isNegative()) adverse += 1;
+      values.push(new Decimal(v));
       dollars = dollars.plus(new Decimal(m.markoutDollars[key]!));
+
+      const drift = m.midDrift[key];
+      if (drift !== null && drift !== undefined) {
+        const d = new Decimal(drift);
+        driftSum = driftSum.plus(d);
+        driftObs += 1;
+        if (d.isNegative()) adverse += 1;
+      }
     }
 
     if (values.length === 0) {
@@ -167,6 +201,7 @@ export function summarizeMarkouts(
         meanMarkout: null,
         medianMarkout: null,
         totalMarkoutDollars: null,
+        meanMidDrift: null,
         adverseRate: null,
       };
     }
@@ -184,7 +219,8 @@ export function summarizeMarkouts(
       meanMarkout: sum.div(values.length).toFixed(8),
       medianMarkout: median.toFixed(8),
       totalMarkoutDollars: dollars.toFixed(6),
-      adverseRate: new Decimal(adverse).div(values.length).toFixed(6),
+      meanMidDrift: driftObs === 0 ? null : driftSum.div(driftObs).toFixed(8),
+      adverseRate: driftObs === 0 ? null : new Decimal(adverse).div(driftObs).toFixed(6),
     };
   });
 }

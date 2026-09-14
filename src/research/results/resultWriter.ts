@@ -73,6 +73,8 @@ const COLUMN_TYPES: Record<string, string> = {
   net_inventory: 'DECIMAL(24,6)',
   abs_inventory: 'DECIMAL(24,6)',
   collateral: 'DECIMAL(24,6)',
+  unmarked_quantity: 'DECIMAL(24,6)',
+  unmarked_positions: 'INTEGER',
 };
 
 function typedProjection(columns: string[]): string {
@@ -277,6 +279,8 @@ function pnlRows(result: BacktestRunResult): Record<string, unknown>[] {
     net_inventory: row.netInventory,
     abs_inventory: row.absInventory,
     collateral: row.collateral,
+    unmarked_positions: row.unmarkedPositions,
+    unmarked_quantity: row.unmarkedQuantity,
   }));
 }
 

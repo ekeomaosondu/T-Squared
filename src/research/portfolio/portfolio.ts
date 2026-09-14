@@ -29,17 +29,31 @@ export interface PositionSnapshot {
   settled: boolean;
 }
 
+/**
+ * A point on the equity curve.
+ *
+ * PnL covers the positions that could be PRICED. A one-sided book has no mid,
+ * and across two dozen deep strikes at least one is one-sided most of the
+ * time; letting a single unpriceable position null the whole total made the
+ * headline figure unavailable in practically every run. Nothing is imputed --
+ * the unpriced part is counted and reported alongside, so a total is never
+ * read as complete when it is not.
+ */
 export interface EquityRow {
   atMs: string;
   cash: string;
   realizedPnl: string;
-  unrealizedPnl: string | null;
-  grossPnl: string | null;
-  netPnl: string | null;
+  /** Unrealized PnL of the positions that have a mark. */
+  unrealizedPnl: string;
+  grossPnl: string;
+  netPnl: string;
   feesPaid: string;
   netInventory: string;
   absInventory: string;
   collateral: string;
+  /** Open positions with no mark, and their size. Excluded from the PnL above. */
+  unmarkedPositions: number;
+  unmarkedQuantity: string;
 }
 
 export interface PortfolioSnapshot {
@@ -139,17 +153,15 @@ export class Portfolio {
     let abs = ZERO;
     let collateral = ZERO;
     let equity = this.cashBalance;
-    let marksComplete = true;
 
     for (const position of this.positions.values()) {
       abs = abs.plus(position.quantity.abs());
       collateral = collateral.plus(collateralRequired(position));
       const mark = marks.get(position.marketTicker) ?? null;
       if (position.quantity.isZero()) continue;
-      if (mark === null) {
-        marksComplete = false;
-        continue;
-      }
+      // An unpriceable position contributes nothing rather than voiding the
+      // whole curve. See EquityRow: it is counted separately, never imputed.
+      if (mark === null) continue;
       equity = equity.plus(position.quantity.mul(mark));
     }
 
@@ -163,9 +175,6 @@ export class Portfolio {
     if (abs.gt(this.maxAbsInventory)) this.maxAbsInventory = abs;
     if (collateral.gt(this.maxCollateral)) this.maxCollateral = collateral;
 
-    // Drawdown is only meaningful when every open position has a mark; a
-    // missing mid must not be read as a position worth zero.
-    if (!marksComplete) return;
     if (this.peakEquity === null || equity.gt(this.peakEquity)) this.peakEquity = equity;
     const drawdown = this.peakEquity.minus(equity);
     if (drawdown.gt(this.maxDrawdownValue)) this.maxDrawdownValue = drawdown;
@@ -186,32 +195,41 @@ export class Portfolio {
    * of million objects to produce a curve with 86,400 points on it.
    */
   equityRow(atMs: bigint, marks: ReadonlyMap<string, Decimal | null>): EquityRow {
-    let unrealized: Decimal | null = ZERO;
+    let unrealized = ZERO;
     let net = ZERO;
     let abs = ZERO;
     let collateral = ZERO;
+    let unmarkedPositions = 0;
+    let unmarkedQuantity = ZERO;
 
     for (const position of this.positions.values()) {
       net = net.plus(position.quantity);
       abs = abs.plus(position.quantity.abs());
       collateral = collateral.plus(collateralRequired(position));
+
       const u = unrealizedPnl(position, marks.get(position.marketTicker) ?? null);
-      if (u === null) unrealized = null;
-      else if (unrealized !== null) unrealized = unrealized.plus(u);
+      if (u === null) {
+        unmarkedPositions += 1;
+        unmarkedQuantity = unmarkedQuantity.plus(position.quantity.abs());
+        continue;
+      }
+      unrealized = unrealized.plus(u);
     }
 
-    const gross = unrealized === null ? null : this.realized.plus(unrealized);
+    const gross = this.realized.plus(unrealized);
     return {
       atMs: atMs.toString(),
       cash: this.cashBalance.toFixed(6),
       realizedPnl: this.realized.toFixed(6),
-      unrealizedPnl: unrealized === null ? null : unrealized.toFixed(6),
-      grossPnl: gross === null ? null : gross.toFixed(6),
-      netPnl: gross === null ? null : gross.minus(this.fees).toFixed(6),
+      unrealizedPnl: unrealized.toFixed(6),
+      grossPnl: gross.toFixed(6),
+      netPnl: gross.minus(this.fees).toFixed(6),
       feesPaid: this.fees.toFixed(6),
       netInventory: net.toFixed(6),
       absInventory: abs.toFixed(6),
       collateral: collateral.toFixed(6),
+      unmarkedPositions,
+      unmarkedQuantity: unmarkedQuantity.toFixed(6),
     };
   }
 

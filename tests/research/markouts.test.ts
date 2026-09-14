@@ -142,7 +142,7 @@ describe('markout computation', () => {
     expect(summary!.adverseRate).toBeNull();
   });
 
-  it('summarizes mean, median and adverse rate over observed fills only', () => {
+  it('summarizes mean and median over observed fills only', () => {
     const fills = [
       fill({ fillId: 'a', filledAtMs: 1_000n, yesPrice: D('0.40') }),
       fill({ fillId: 'b', filledAtMs: 1_000n, yesPrice: D('0.45') }),
@@ -150,10 +150,41 @@ describe('markout computation', () => {
     ];
     const markouts = computeMarkouts(fills, store, 'mid', [100]);
     const [summary] = summarizeMarkouts(markouts, [100]);
-    // Mid at +100ms is 0.435; markouts are +0.035, -0.015, -0.065.
+    // Mid at +100ms is 0.435; markouts from the fill price are +0.035, -0.015,
+    // -0.065.
     expect(summary!.observations).toBe(3);
     expect(summary!.meanMarkout).toBe('-0.01500000');
     expect(summary!.medianMarkout).toBe('-0.01500000');
-    expect(summary!.adverseRate).toBe('0.666667');
+  });
+
+  it('separates the half-spread from the drift', () => {
+    // All three fills happen at the same instant, so the market did the same
+    // thing after each of them. Their TOTAL markouts differ only because they
+    // paid different prices; their drift is identical. Conflating the two is
+    // how a maker's structural half-spread gets mistaken for alpha.
+    const fills = [
+      fill({ fillId: 'a', filledAtMs: 1_000n, yesPrice: D('0.40') }),
+      fill({ fillId: 'b', filledAtMs: 1_000n, yesPrice: D('0.45') }),
+    ];
+    const markouts = computeMarkouts(fills, store, 'mid', [100]);
+    // Mid at the fill is 0.425, at +100ms it is 0.435: a one-cent drift our
+    // way on a buy, for both.
+    expect(markouts.map((m) => m.midDrift['100'])).toEqual(['0.010000', '0.010000']);
+    expect(markouts.map((m) => m.markouts['100'])).toEqual(['0.035000', '-0.015000']);
+
+    const [summary] = summarizeMarkouts(markouts, [100]);
+    expect(summary!.meanMidDrift).toBe('0.01000000');
+    // Favourable drift on both, so nothing was picked off -- even though one
+    // of the two has a negative total markout.
+    expect(summary!.adverseRate).toBe('0.000000');
+  });
+
+  it('reports adverse selection when the mid runs away from the fill', () => {
+    const seller = fill({ fillId: 'd', filledAtMs: 1_000n, yesAction: 'sell', yesPrice: D('0.45') });
+    const markouts = computeMarkouts([seller], store, 'mid', [100]);
+    // Sold, and the mid rose from 0.425 to 0.435: against us.
+    expect(markouts[0]!.midDrift['100']).toBe('-0.010000');
+    const [summary] = summarizeMarkouts(markouts, [100]);
+    expect(summary!.adverseRate).toBe('1.000000');
   });
 });
