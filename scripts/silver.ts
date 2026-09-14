@@ -5,6 +5,7 @@ import { selectArchiveStore } from '@/src/persistence/archiveStore';
 import { closeDb, db } from '@/src/persistence/db';
 import { SilverExporter } from '@/src/persistence/silver';
 import { MarketStateExporter } from '@/src/persistence/silverMarketState';
+import { CalibrationExporter } from '@/src/persistence/silverCalibration';
 import { logger } from '@/src/logging/logger';
 
 /**
@@ -16,6 +17,7 @@ import { logger } from '@/src/logging/logger';
  *   npm run silver -- --status
  *   npm run silver -- --allow-shrink   permit replacing a larger existing file
  *   npm run silver -- --market-state   snapshot market definitions and results only
+ *   npm run silver -- --calibration    export the execution-calibration dataset
  *
  * Exporting is safe to run repeatedly. Expiry is gated on every silver export
  * for the day being verified, and is off unless --expire is passed AND
@@ -81,6 +83,17 @@ async function main(): Promise<void> {
     for (const f of snapshot.failed) console.error(`  FAILED ${f.table}: ${f.error}`);
     await closeDb();
     process.exitCode = snapshot.failed.length > 0 ? 1 : 0;
+    return;
+  }
+
+  if (argv.includes('--calibration')) {
+    const out = await new CalibrationExporter(sql, store, e.DATASET_ID).export(get('--day'));
+    for (const f of out.files) {
+      console.log(`  ${f.date}  ${f.table.padEnd(32)} ${String(f.rows).padStart(7)} rows  ${(f.bytes / 1e3).toFixed(1)} kB`);
+    }
+    for (const f of out.failed) console.error(`  FAILED ${f.table}: ${f.error}`);
+    await closeDb();
+    process.exitCode = out.failed.length > 0 ? 1 : 0;
     return;
   }
 

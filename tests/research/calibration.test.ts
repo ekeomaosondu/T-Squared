@@ -85,6 +85,21 @@ describe('calibration risk envelope', () => {
     );
   });
 
+  it('projects the position a fill WOULD create, not the one it finds', () => {
+    // Kalshi fills fractionally. A probe that filled 0.85 leaves a position
+    // under a one-contract limit; letting another probe in took a live run to
+    // -1.85 and tripped the kill switch. The switch was right to fire and this
+    // check should have made it unnecessary.
+    const partial = emptyAccount({ positionByMarket: new Map([['A', D('-0.85')]]) });
+    const decision = mayPlaceProbe(CALIBRATION_V0, partial, 'A', 'S', D('0.10'));
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('max_position_per_market');
+    expect(decision.detail).toMatch(/1\.85/);
+
+    // A flat market is still fine: 0 + 1 does not exceed 1.
+    expect(mayPlaceProbe(CALIBRATION_V0, emptyAccount(), 'A', 'S', D('0.10')).allowed).toBe(true);
+  });
+
   it('stops at the daily fill and order ceilings', () => {
     expect(
       mayPlaceProbe(CALIBRATION_V0, emptyAccount({ fillsToday: 50 }), 'A', 'S', D('0.1')).reason,

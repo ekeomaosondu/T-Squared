@@ -27,6 +27,27 @@ function sourceFiles(dir: string): string[] {
 const files = ROOTS.flatMap((r) => sourceFiles(path.join(process.cwd(), r)));
 
 /**
+ * Tokens that may appear bare in an ordering expression without being a column
+ * reference. Kept deliberately short: anything not here is treated as a bare
+ * column and flagged.
+ */
+const SQL_NOISE = new Set([
+  'CASE',
+  'WHEN',
+  'THEN',
+  'ELSE',
+  'END',
+  'AND',
+  'OR',
+  'NOT',
+  'NULL',
+  'TRUE',
+  'FALSE',
+  'IS',
+  'INTERVAL',
+]);
+
+/**
  * Strips comments and single/double-quoted string literals.
  *
  * All SQL in this codebase lives in template literals, so prose in an ordinary
@@ -51,8 +72,12 @@ describe('SQL ordering conventions', () => {
       const re = /\b(ORDER\s+BY|GROUP\s+BY|DISTINCT\s+ON\s*\()\s+?([^\n;`]+)/gi;
 
       for (const m of text.matchAll(re)) {
-        // Stop the clause at whatever keyword follows it on the same line.
-        const clause = m[2]!.split(/\b(LIMIT|OFFSET|FETCH|FOR|RETURNING|HAVING|WINDOW)\b/i)[0]!;
+        // Stop the clause at whatever keyword follows it. ORDER BY is included:
+        // a GROUP BY clause ends where an ORDER BY begins, and swallowing it
+        // made `GROUP BY p.x ORDER BY p.x` look like one malformed term.
+        const clause = m[2]!.split(
+          /\b(ORDER\s+BY|LIMIT|OFFSET|FETCH|FOR|RETURNING|HAVING|WINDOW)\b/i,
+        )[0]!;
         for (const rawTerm of clause.split(',')) {
           const term = rawTerm
             .replace(/\b(ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST)\b/gi, '')
@@ -64,8 +89,16 @@ describe('SQL ordering conventions', () => {
           // Interpolations, literals, positional refs and function calls are fine.
           if (/^\$\{|^\d+$|^'/.test(term)) continue;
           if (/[(]/.test(term)) continue;
-          // A qualified reference (alias.column) is what we require.
-          if (/^[A-Za-z_][\w$]*\.[A-Za-z_]\w*$/.test(term)) continue;
+
+          // The rule is that no BARE NAME may appear, because Postgres resolves
+          // a bare name to an output alias in preference to an input column.
+          // An arithmetic expression is fine as long as every identifier in it
+          // is qualified: `p.a - p.b` has no bare name to be captured.
+          const bare = [...term.matchAll(/[A-Za-z_][\w$]*(?:\.[A-Za-z_]\w*)?/g)]
+            .map((t) => t[0])
+            .filter((t) => !t.includes('.'))
+            .filter((t) => !SQL_NOISE.has(t.toUpperCase()));
+          if (bare.length === 0) continue;
 
           violations.push(`${path.relative(process.cwd(), file)}: "${m[1]} ${term}"`);
         }
@@ -73,6 +106,25 @@ describe('SQL ordering conventions', () => {
     }
 
     expect(violations, `unqualified ordering keys:\n${violations.join('\n')}`).toEqual([]);
+  });
+
+  it('still catches a bare name inside an otherwise qualified expression', () => {
+    // The guard was widened to accept `p.a - p.b`, so this pins the thing it
+    // must still reject: one unqualified operand hiding among qualified ones.
+    const sample = "sql`SELECT x FROM t p ORDER BY p.a - received_at_ms`";
+    const re = /\b(ORDER\s+BY|GROUP\s+BY|DISTINCT\s+ON\s*\()\s+?([^\n;`]+)/gi;
+    const found: string[] = [];
+    for (const m of sample.matchAll(re)) {
+      for (const rawTerm of m[2]!.split(',')) {
+        const term = rawTerm.replace(/\)[\s\S]*$/, '').trim();
+        const bare = [...term.matchAll(/[A-Za-z_][\w$]*(?:\.[A-Za-z_]\w*)?/g)]
+          .map((t) => t[0])
+          .filter((t) => !t.includes('.'))
+          .filter((t) => !SQL_NOISE.has(t.toUpperCase()));
+        if (bare.length > 0) found.push(bare.join(','));
+      }
+    }
+    expect(found).toEqual(['received_at_ms']);
   });
 
   it('never aliases a cast back onto the source column name', () => {

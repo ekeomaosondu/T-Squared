@@ -149,12 +149,21 @@ export function mayPlaceProbe(
     return { allowed: false, reason: 'max_probes_per_series', detail: seriesTicker };
   }
 
+  // Checked against the position this probe WOULD create, not the one it
+  // finds. Kalshi fills fractionally: a probe that filled 0.85 leaves a
+  // position under a one-contract limit, which used to let another probe in,
+  // whose full fill then took the market to 1.85 and tripped the kill switch.
+  // The kill switch was right to fire; this check should have made it
+  // unnecessary.
   const position = state.positionByMarket.get(marketTicker) ?? ZERO;
-  if (position.abs().gte(envelope.maxPositionPerMarket)) {
+  const worstCasePosition = position.abs().plus(envelope.orderSize);
+  if (worstCasePosition.gt(envelope.maxPositionPerMarket)) {
     return {
       allowed: false,
       reason: 'max_position_per_market',
-      detail: `${marketTicker} holds ${position.toString()}`,
+      detail:
+        `${marketTicker} holds ${position.toString()}; another ` +
+        `${envelope.orderSize} would reach ${worstCasePosition.toString()}`,
     };
   }
 

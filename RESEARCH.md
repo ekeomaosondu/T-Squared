@@ -496,22 +496,110 @@ be disabled with `--no-verify` once a day has been verified.
 
 ---
 
+## Calibration
+
+Real one-contract post-only probes, placed to learn how the queue behaves
+rather than to make money.
+
+```bash
+npm run calibrate -- preflight                                  # verify, place nothing
+npm run calibrate -- run --dry-run --minutes 10
+npm run calibrate -- run --minutes 30 --i-understand-this-places-real-orders
+npm run calibrate -- analyze
+npm run silver -- --calibration                                 # export to the lake
+```
+
+**Why real orders.** Kalshi reports true queue position, but only for orders
+actually resting on the exchange. No shadow run can obtain that number, so the
+experiment buys it.
+
+**Why it is not optimised for fills.** Side is a coin flip. Market selection
+rotates across depth and flow strata. The price is fixed for the whole dwell
+and never repriced. All three cost fill rate on purpose — a dataset gathered
+only where we expected to fill teaches a model the conditions under which we
+chose easy fills. Non-fills are retained as censored observations, and they are
+most of the information.
+
+The v0 envelope: 1 contract, 2 resting orders, 1 per market, 1 per series,
+$5 worst-case exposure, 50 fills and 200 orders a day, mid within 0.15–0.85,
+never within 30 minutes of close. Dwell is drawn from 10/30/60/120 s.
+
+**Safety is layered.** Order creation is never retried — a create that times
+out may be resting right now, so it throws and the caller reconciles by asking.
+The probe row is written *before* the order is sent. The envelope is seeded
+from the exchange at startup, not from process memory. Book invalid, private
+feed down, persistence failing, an ambiguous order or any risk breach stops new
+probes; a breach never crosses the spread to flatten.
+
+### First results (38 probes, 20 minutes)
+
+Measured latency, which is what should eventually replace the 0/50/100/250 ms
+sweep:
+
+```
+operation                    n    p50    p90    p99
+submit                      38     40     82     87
+cancel                      29     40    209    543
+private ack after HTTP ack  38      2      5     15
+queue visible after ack     37    816   1616   1804
+```
+
+That last row is the non-obvious one: the exchange does not report a new
+order's queue position for about **0.8 seconds** after acknowledging it.
+
+Fill models against the same real orders:
+
+```
+model                  n   TP   FP   FN   TN   fill-time err   queue bias
+conservative_queue    38    6    0    3   29          122 ms        +2.2
+queue_decay           38    6    0    3   29          122 ms        +2.2
+touch                 38    9    3    0   26       10,154 ms       -43.3
+```
+
+`conservative_queue` produced **no false positives** and a 122 ms fill-time
+error. `touch` caught every fill but invented three and was ten seconds out.
+For a backtest the false positive is the expensive error: it inflates volume,
+spread capture and PnL at once, silently.
+
+One probe filled from **66.8 contracts back in the queue**, which no
+conservative model would predict.
+
+Queue movement against the visible book, over 2,567 observation steps:
+
+```
+steps where Q moved         24
+mean removed per step     0.50
+UNEXPLAINED moves           20
+```
+
+Cancellations at our level happen constantly and almost never advance our
+queue — which is the assumption `conservative_queue` is built on, and the first
+evidence for it. But 20 of the 24 actual queue moves came with no trade and no
+withdrawal visible at that price, so market-by-price data is missing most of
+what moves the queue. **That is the first thing to investigate**, and it has to
+be resolved before any α is fitted: a parameter fitted to four explained moves
+would be noise with a decimal point.
+
+Thirty-eight probes is a pilot, not a dataset. Every figure above is printed
+with its sample size for that reason.
+
+---
+
 ## What is not built yet
 
-CALIBRATION mode places **real orders** and is therefore not something to switch
-on unilaterally. The scaffolding it needs — execution modes, the shadow record,
-decision/arrival book capture, counterfactual fill models — is in place; what
-remains is order placement against the private API, private order/fill
-recording, and the queue-position observations that make the calibration
-dataset. Those wait on an explicit decision to risk capital.
+Blocked on more calibration data:
 
-Downstream of calibration, and blocked on it:
-
-- an empirical latency dataset (`t_ack − t_send`, p50/p90/p95/p99 by operation)
-  to replace the fixed 0/50/100/250 ms sweep
-- fitting `α` in `Q(t+Δ) = Q(t) − V_executed − α·C(t)` against observed queue
-  positions, replacing the arbitrary `queue_decay` parameters
+- resolving the unexplained queue moves, which must come before any fit
+- fitting `α` in `Q(t+Δ) = Q(t) − V_executed − α·C(t)`, replacing the arbitrary
+  `queue_decay` parameters
+- `EmpiricalLatencyModel.fromCalibrationDataset(...)`, replacing the fixed
+  latency sweep with the measured distributions
 - re-running the benchmark matrix under the calibrated model
+
+Not built and not blocked, just deliberately absent: an exchange-side order
+group (the create endpoint 404s on this account, so the process-side limits are
+the only guard), and probe repricing, which v0 omits so that queue mechanics
+are not confounded with a quoting policy.
 
 Still not built, deliberately: dashboard, distributed compute, parameter
 optimizer, ML framework, ClickHouse, Kafka, Ray, Spark, Iceberg,

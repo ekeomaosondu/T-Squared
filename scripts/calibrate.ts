@@ -14,6 +14,12 @@ import {
 } from '@/src/research/calibration/calibrationRunner';
 import { CALIBRATION_V0 } from '@/src/research/calibration/riskEnvelope';
 import { makeFillModel } from '@/src/research/registry';
+import {
+  censoring,
+  latencyDistribution,
+  modelAgreement,
+  queueSteps,
+} from '@/src/research/calibration/analysis';
 import { logger } from '@/src/logging/logger';
 
 /**
@@ -364,6 +370,87 @@ async function printSummary(sql: ReturnType<typeof db>, runId: string): Promise<
   console.log('');
 }
 
+/**
+ * Reads the calibration dataset.
+ *
+ * Deliberately reports the sample size beside every figure. These numbers only
+ * become model parameters when there are enough of them, and a table that
+ * hides n invites someone to fit alpha to nine observations.
+ */
+async function analyze(args: Args): Promise<void> {
+  const sql = db();
+  const runId = args.flags.get('run');
+  try {
+    const pad = (v: unknown, n: number) => String(v ?? '-').padStart(n);
+
+    console.log('\n=== measured latency (ms) ===\n');
+    console.log(`  ${'operation'.padEnd(26)}${pad('n', 6)}${pad('p50', 8)}${pad('p90', 8)}${pad('p95', 8)}${pad('p99', 8)}${pad('max', 8)}`);
+    for (const l of await latencyDistribution(sql, runId)) {
+      console.log(
+        `  ${l.operation.padEnd(26)}${pad(l.n, 6)}${pad(l.p50, 8)}${pad(l.p90, 8)}` +
+          `${pad(l.p95, 8)}${pad(l.p99, 8)}${pad(l.max, 8)}`,
+      );
+    }
+    console.log(
+      '\n  These replace the arbitrary 0/50/100/250ms sweep once there are enough of them.',
+    );
+
+    console.log('\n=== fill models vs reality ===\n');
+    console.log(
+      `  ${'model'.padEnd(20)}${pad('n', 5)}${pad('TP', 5)}${pad('FP', 5)}${pad('FN', 5)}${pad('TN', 5)}` +
+        `${pad('fillErr ms', 12)}${pad('queueBias', 11)}`,
+    );
+    for (const m of await modelAgreement(sql, runId)) {
+      console.log(
+        `  ${m.fillModel.padEnd(20)}${pad(m.probes, 5)}${pad(m.truePositive, 5)}` +
+          `${pad(m.falsePositive, 5)}${pad(m.falseNegative, 5)}${pad(m.trueNegative, 5)}` +
+          `${pad(m.meanFillTimeErrorMs === null ? '-' : m.meanFillTimeErrorMs.toFixed(0), 12)}` +
+          `${pad(m.meanQueueBiasAtEntry === null ? '-' : m.meanQueueBiasAtEntry.toFixed(1), 11)}`,
+      );
+    }
+    console.log(
+      '\n  FP is the expensive one: a backtest booking a fill that would not have happened,',
+    );
+    console.log('  which inflates volume, spread capture and PnL at once and does it silently.');
+    console.log(
+      '  queueBias is the model\'s queue-at-entry minus the exchange\'s own reading.',
+    );
+
+    const q = await queueSteps(sql, runId);
+    console.log('\n=== queue movement vs the visible book ===\n');
+    console.log(`  observation steps        ${q.steps}`);
+    console.log(`  steps where Q moved      ${q.movingSteps}`);
+    console.log(`  mean dQ per step         ${q.meanDeltaQ?.toFixed(3) ?? '-'}`);
+    console.log(`  mean executed per step   ${q.meanExecuted?.toFixed(3) ?? '-'}`);
+    console.log(`  mean removed per step    ${q.meanRemoved?.toFixed(3) ?? '-'}`);
+    console.log(`  naive alpha              ${q.naiveAlpha?.toFixed(3) ?? '-'}   (dQ = executed + alpha * removed)`);
+    console.log(`  UNEXPLAINED moves        ${q.unexplainedSteps}   Q moved with no trade and no withdrawal seen`);
+    console.log(
+      '\n  An unexplained move is the interesting failure: market-by-price data missed',
+    );
+    console.log('  something that no value of alpha can recover.');
+
+    const c = await censoring(sql, runId);
+    console.log('\n=== censoring ===\n');
+    console.log(`  probes placed   ${c.placed}`);
+    console.log(`  filled          ${c.filled}`);
+    console.log(`  censored        ${c.censored}` +
+      (c.censoredRestingSeconds ? `  (${c.censoredRestingSeconds.toFixed(0)}s of resting time)` : ''));
+    console.log('\n  fill rate by dwell');
+    for (const d of c.byDwell) {
+      console.log(
+        `    ${String(d.dwellMs / 1000).padStart(4)}s  ${d.filled}/${d.placed}`,
+      );
+    }
+    console.log(
+      '\n  Censored probes are not failures. Each one bounds the fill time from below,',
+    );
+    console.log('  and a fill-only dataset would be missing exactly them.\n');
+  } finally {
+    await closeDb();
+  }
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   try {
@@ -372,6 +459,8 @@ async function main(): Promise<void> {
         return await preflight(args);
       case 'run':
         return await run(args);
+      case 'analyze':
+        return await analyze(args);
       default:
         console.log(
           [
@@ -379,6 +468,7 @@ async function main(): Promise<void> {
             '',
             '  preflight   verify every private endpoint and the feeds; place nothing',
             '  run         run the probe loop',
+            '  analyze     read the dataset: latency, model agreement, queue movement',
             '',
             'flags:',
             '  --dry-run                                    full loop, no orders sent',
