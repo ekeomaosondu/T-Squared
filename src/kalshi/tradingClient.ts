@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { KalshiSigner } from '@/src/kalshi/auth';
+import type { Decimal } from '@/src/book/decimal';
 import { KalshiApiError } from '@/src/kalshi/restClient';
 import { logger } from '@/src/logging/logger';
 
@@ -27,7 +28,46 @@ import { logger } from '@/src/logging/logger';
 
 const API_PREFIX = '/trade-api/v2';
 
-/** Fields we depend on. Everything else passes through unvalidated. */
+/**
+ * The V2 order API.
+ *
+ * Materially different from the endpoint that used to live at
+ * `/portfolio/orders`, which now answers 410 `deprecated_v1_order_endpoint`:
+ *
+ *   path      /portfolio/events/orders
+ *   side      'bid' or 'ask' -- the YES ladder directly, not yes/no + buy/sell
+ *   price     a fixed-point DOLLAR string, not integer cents
+ *   count     a fixed-point string
+ *
+ * The bid/ask form is a simplification worth noticing: it is exactly the
+ * representation the research layer already uses internally, so a probe's side
+ * maps straight through instead of being encoded as a NO buy at the
+ * complement.
+ */
+const V2OrderResponse = z
+  .object({
+    order_id: z.string(),
+    client_order_id: z.string().nullish(),
+    fill_count: z.union([z.number(), z.string()]).nullish(),
+    remaining_count: z.union([z.number(), z.string()]).nullish(),
+    average_fill_price: z.string().nullish(),
+    average_fee_paid: z.string().nullish(),
+    ts_ms: z.number().nullish(),
+  })
+  .passthrough();
+
+export type V2Order = z.infer<typeof V2OrderResponse>;
+
+const V2CancelResponse = z
+  .object({
+    order_id: z.string().nullish(),
+    client_order_id: z.string().nullish(),
+    reduced_by: z.string().nullish(),
+    ts_ms: z.number().nullish(),
+  })
+  .passthrough();
+
+/** The legacy read endpoints, which are not deprecated. */
 const OrderSchema = z
   .object({
     order_id: z.string(),
@@ -41,20 +81,22 @@ const OrderSchema = z
     no_price_dollars: z.string().nullish(),
     initial_count: z.union([z.number(), z.string()]).nullish(),
     remaining_count: z.union([z.number(), z.string()]).nullish(),
-    queue_position: z.union([z.number(), z.string()]).nullish(),
+    remaining_count_fp: z.string().nullish(),
+    fill_count_fp: z.string().nullish(),
+    book_side: z.string().nullish(),
+    outcome_side: z.string().nullish(),
+    maker_fees_dollars: z.string().nullish(),
+    taker_fees_dollars: z.string().nullish(),
     created_time: z.string().nullish(),
   })
   .passthrough();
 
 export type KalshiOrder = z.infer<typeof OrderSchema>;
 
-const CreateOrderResponse = z.object({ order: OrderSchema }).passthrough();
 const GetOrderResponse = z.object({ order: OrderSchema }).passthrough();
+
 const ListOrdersResponse = z
   .object({ orders: z.array(OrderSchema).nullish(), cursor: z.string().nullish() })
-  .passthrough();
-const CancelOrderResponse = z
-  .object({ order: OrderSchema.nullish(), reduced_by: z.union([z.number(), z.string()]).nullish() })
   .passthrough();
 
 /**
@@ -70,6 +112,15 @@ const QueuePositionSchema = z
     order_id: z.string(),
     market_ticker: z.string().nullish(),
     ticker: z.string().nullish(),
+    /**
+     * Contracts ahead of this order, as a FIXED-POINT STRING.
+     *
+     * `queue_position_fp`, not `queue_position`. The difference cost a live
+     * run: the response parsed cleanly, every row came back, and the field
+     * this code was reading was simply absent -- so 685 observations recorded
+     * a null queue position and looked like a working experiment.
+     */
+    queue_position_fp: z.string().nullish(),
     queue_position: z.union([z.number(), z.string()]).nullish(),
   })
   .passthrough();
@@ -145,10 +196,16 @@ export interface Timed<T> {
 export interface CreateOrderRequest {
   clientOrderId: string;
   marketTicker: string;
-  action: 'buy' | 'sell';
-  side: 'yes' | 'no';
-  /** Whole cents, 1..99. Kalshi's V2 order API prices in cents. */
-  priceCents: number;
+  /**
+   * Which side of the YES ladder to rest on.
+   *
+   * The V2 API takes this directly, so there is no yes/no + buy/sell encoding
+   * to get backwards. `bid` at 0.42 bids 42c for YES; `ask` at 0.42 offers YES
+   * at 42c.
+   */
+  side: 'bid' | 'ask';
+  /** YES-ladder price in dollars. Sent as a fixed-point string. */
+  price: Decimal;
   count: number;
   /**
    * Rejected rather than crossed if it would take liquidity.
@@ -160,12 +217,12 @@ export interface CreateOrderRequest {
   /**
    * Cancelled by the exchange if the market pauses.
    *
-   * A pause is exactly when our own state becomes least trustworthy, so the
-   * safest resting order during one is no resting order.
+   * A pause is exactly when our own state is least trustworthy, so the safest
+   * resting order during one is no resting order.
    */
   cancelOrderOnPause: boolean;
-  /** Exchange-side backstop, longer than the planned dwell. */
-  expirationTs?: number;
+  /** Exchange-side backstop, longer than the planned dwell. Unix seconds. */
+  expirationTime?: number;
   orderGroupId?: string;
 }
 
@@ -264,24 +321,28 @@ export class KalshiTradingClient {
    * else. An HTTP error with a response is unambiguous -- the exchange
    * answered -- and is thrown as-is.
    */
-  async createOrder(req: CreateOrderRequest): Promise<Timed<KalshiOrder>> {
+  async createOrder(req: CreateOrderRequest): Promise<Timed<V2Order>> {
     const body: Record<string, unknown> = {
-      client_order_id: req.clientOrderId,
       ticker: req.marketTicker,
-      action: req.action,
       side: req.side,
-      type: 'limit',
-      count: req.count,
+      // Fixed-point strings, not numbers: the exchange prices in dollars and a
+      // float would reintroduce exactly the rounding this codebase avoids
+      // everywhere else.
+      count: req.count.toFixed(2),
+      price: req.price.toFixed(4),
+      time_in_force: 'good_till_canceled',
+      // Irrelevant at one resting order per market, but the field is required
+      // and 'maker' is the conservative reading: our resting order yields.
+      self_trade_prevention_type: 'maker',
       post_only: req.postOnly,
       cancel_order_on_pause: req.cancelOrderOnPause,
-      ...(req.side === 'yes' ? { yes_price: req.priceCents } : { no_price: req.priceCents }),
-      ...(req.expirationTs !== undefined ? { expiration_ts: req.expirationTs } : {}),
+      client_order_id: req.clientOrderId,
+      ...(req.expirationTime !== undefined ? { expiration_time: req.expirationTime } : {}),
       ...(req.orderGroupId !== undefined ? { order_group_id: req.orderGroupId } : {}),
     };
 
     try {
-      const out = await this.call('POST', '/portfolio/orders', CreateOrderResponse, { body });
-      return { value: out.value.order, timing: out.timing };
+      return await this.call('POST', '/portfolio/events/orders', V2OrderResponse, { body });
     } catch (err) {
       if (err instanceof KalshiApiError) throw err; // the exchange answered
       throw new AmbiguousOrderError(req.clientOrderId, 'create', err);
@@ -293,15 +354,23 @@ export class KalshiTradingClient {
    *
    * Also never retried, for the same reason in reverse: a cancel whose outcome
    * is unknown must not be assumed to have worked. Reconcile.
+   *
+   * `market_ticker` is passed so the exchange can auto-route without us having
+   * to track which shard the order landed on.
    */
-  async cancelOrder(orderId: string, clientOrderId: string): Promise<Timed<KalshiOrder | null>> {
+  async cancelOrder(
+    orderId: string,
+    clientOrderId: string,
+    marketTicker: string,
+  ): Promise<Timed<{ reducedBy: string | null }>> {
     try {
       const out = await this.call(
         'DELETE',
-        `/portfolio/orders/${encodeURIComponent(orderId)}`,
-        CancelOrderResponse,
+        `/portfolio/events/orders/${encodeURIComponent(orderId)}`,
+        V2CancelResponse,
+        { query: new URLSearchParams({ market_ticker: marketTicker }) },
       );
-      return { value: out.value.order ?? null, timing: out.timing };
+      return { value: { reducedBy: out.value.reduced_by ?? null }, timing: out.timing };
     } catch (err) {
       if (err instanceof KalshiApiError) throw err;
       throw new AmbiguousOrderError(clientOrderId, 'cancel', err);
@@ -357,13 +426,13 @@ export class KalshiTradingClient {
     );
     const rows = out.value.queue_positions ?? out.value.order_queue_positions ?? [];
     return {
-      value: rows.map((r) => ({
-        orderId: r.order_id,
-        queuePosition:
-          r.queue_position === null || r.queue_position === undefined
-            ? null
-            : Number(r.queue_position),
-      })),
+      value: rows.map((r) => {
+        const raw = r.queue_position_fp ?? r.queue_position;
+        return {
+          orderId: r.order_id,
+          queuePosition: raw === null || raw === undefined ? null : Number(raw),
+        };
+      }),
       timing: out.timing,
     };
   }

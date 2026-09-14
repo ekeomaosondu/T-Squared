@@ -126,8 +126,8 @@ export class CalibrationStore {
     probeId: string,
     args: {
       orderId: string | null;
-      httpSendTsMs: number;
-      httpAckTsMs: number;
+      httpSendTsMs: number | null;
+      httpAckTsMs: number | null;
       httpStatus: number | null;
       terminalState: string | null;
       rejectReason: string | null;
@@ -138,7 +138,11 @@ export class CalibrationStore {
          SET order_id          = ${args.orderId},
              http_send_ts_ms   = ${args.httpSendTsMs},
              http_ack_ts_ms    = ${args.httpAckTsMs},
-             submit_latency_ms = ${args.httpAckTsMs - args.httpSendTsMs},
+             submit_latency_ms = ${
+               args.httpSendTsMs !== null && args.httpAckTsMs !== null
+                 ? args.httpAckTsMs - args.httpSendTsMs
+                 : null
+             },
              http_status       = ${args.httpStatus},
              terminal_state    = coalesce(${args.terminalState}, terminal_state),
              reject_reason     = ${args.rejectReason}

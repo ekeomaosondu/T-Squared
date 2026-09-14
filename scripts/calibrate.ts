@@ -135,6 +135,55 @@ async function preflight(args: Args): Promise<void> {
   }
   await check('positions', () => trading.getPositions(), (v) => `${v.length} market position(s)`);
 
+  // The V2 create-order path, verified WITHOUT placing an order.
+  //
+  // A real market with an impossible price: if the path, auth and body shape
+  // are right the exchange answers 400 invalid_parameters, and nothing can
+  // rest or fill at a price of zero. This is the check that would have caught
+  // the 410 deprecated_v1_order_endpoint before a run rather than after 23
+  // rejected probes.
+  if (scopeTicker) {
+    const path = '/trade-api/v2/portfolio/events/orders';
+    try {
+      const res = await fetch(`${endpoints.rest}${path}`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          ...signer.headers('POST', path),
+        },
+        body: JSON.stringify({
+          ticker: scopeTicker,
+          side: 'bid',
+          count: '1.00',
+          price: '0.0000',
+          time_in_force: 'good_till_canceled',
+          self_trade_prevention_type: 'maker',
+          post_only: true,
+          cancel_order_on_pause: true,
+          client_order_id: `preflight-${Date.now()}`,
+        }),
+      });
+      const text = (await res.text()).slice(0, 160);
+      results.push({
+        name: 'v2 create-order path',
+        // 400 is the PASS: the route existed, authenticated, resolved the
+        // market and got as far as validating the price. The exact error code
+        // varies (invalid_price, invalid_parameters), so the STATUS is what is
+        // asserted -- 404 means the path moved, 410 means it was deprecated,
+        // and those are the failures this check exists to catch.
+        ok: res.status === 400,
+        detail:
+          res.status === 400
+            ? `route reachable; rejected the impossible price as expected (${text})`
+            : `${res.status} ${text}`,
+        ms: null,
+      });
+    } catch (err) {
+      results.push({ name: 'v2 create-order path', ok: false, detail: String(err), ms: null });
+    }
+  }
+
   // The private feed, connected and subscribed but never used to trade.
   const feed = new KalshiPrivateFeed({ wsUrl: endpoints.ws, signer });
   let feedUp = false;

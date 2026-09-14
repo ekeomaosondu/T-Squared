@@ -114,8 +114,11 @@ interface ActiveProbe {
   state: ProbeState;
   queueSeqNo: number;
   lastQueuePosition: number | null;
+  recordedInitialQueue: boolean;
   premium: Decimal;
   stratum: string;
+  /** Each model's belief about the queue ahead, captured while it rested. */
+  modelledQueueAtEntry: Map<string, Decimal>;
 }
 
 /** Why the runner stopped placing orders. */
@@ -213,10 +216,23 @@ export class CalibrationRunner {
         );
         this.orderGroupId = group.value;
       } catch (err) {
+        // The exchange-side runaway guard is a nice-to-have, not a
+        // prerequisite. Losing it means the process-side limits are the only
+        // thing standing between a bug and a runaway, so it is logged loudly
+        // rather than swallowed -- but at one contract, two resting orders and
+        // a five-dollar cap the blast radius is bounded either way.
         logger.warn(
           { event: 'order_group_unavailable', err: String(err) },
-          'could not create an order group; proceeding on process-side limits alone',
+          'no exchange-side order group; process-side limits are the only guard',
         );
+        await this.store
+          .event({
+            runId: this.runId,
+            kind: 'warning',
+            reason: 'order group unavailable; running on process-side limits alone',
+            detail: { error: String(err).slice(0, 200) },
+          })
+          .catch(() => {});
       }
     }
 
@@ -625,8 +641,10 @@ export class CalibrationRunner {
       state: 'submitting',
       queueSeqNo: 0,
       lastQueuePosition: null,
+      recordedInitialQueue: false,
       premium,
       stratum: stratumId(candidate.stratum),
+      modelledQueueAtEntry: new Map(),
     };
     this.active.set(clientOrderId, probe);
     this.ordersToday += 1;
@@ -652,13 +670,14 @@ export class CalibrationRunner {
       const created = await this.deps.trading.createOrder({
         clientOrderId,
         marketTicker: candidate.marketTicker,
-        action: 'buy',
-        side: orderSide,
-        priceCents,
+        // The V2 API takes the YES-ladder side directly, so the probe's own
+        // side maps straight through with no yes/no encoding to invert.
+        side,
+        price: yesPrice,
         count: this.config.envelope.orderSize,
         postOnly: true,
         cancelOrderOnPause: true,
-        expirationTs,
+        expirationTime: expirationTs,
         ...(this.orderGroupId ? { orderGroupId: this.orderGroupId } : {}),
       });
 
@@ -682,6 +701,16 @@ export class CalibrationRunner {
       await this.store.bumpRunCounters(this.runId, { placed: 1 }).catch(() => {});
 
       this.submitCounterfactuals(probe);
+      // Read the modelled queue NOW, while the counterfactual orders are still
+      // resting. After they are retired the queue state is gone, which is why
+      // the first live run recorded a null modelled queue for every probe that
+      // did not fill -- the comparison we actually care about.
+      for (const c of this.counterfactuals) {
+        const cfOrder = c.exchange.findByClientId(probe.clientOrderId);
+        if (cfOrder?.queue) {
+          probe.modelledQueueAtEntry.set(c.model.name, cfOrder.queue.queueAheadAtEntry);
+        }
+      }
       void this.pollQueuePositions();
       this.scheduleDwellTimeout(probe);
     } catch (err) {
@@ -703,10 +732,13 @@ export class CalibrationRunner {
 
     if (err instanceof AmbiguousOrderError) {
       probe.state = 'ambiguous';
+      // No timings. A rejected or ambiguous create has no round trip to
+      // measure, and writing Date.now() twice would seed the latency dataset
+      // with zeroes that drag the median to nothing.
       await this.store.recordSubmission(probe.probeId, {
         orderId: null,
-        httpSendTsMs: Date.now(),
-        httpAckTsMs: Date.now(),
+        httpSendTsMs: null,
+        httpAckTsMs: null,
         httpStatus: null,
         terminalState: 'ambiguous',
         rejectReason: err.message,
@@ -720,8 +752,8 @@ export class CalibrationRunner {
     this.active.delete(probe.clientOrderId);
     await this.store.recordSubmission(probe.probeId, {
       orderId: null,
-      httpSendTsMs: Date.now(),
-      httpAckTsMs: Date.now(),
+      httpSendTsMs: null,
+      httpAckTsMs: null,
       httpStatus: err instanceof KalshiApiError ? err.status : null,
       terminalState: 'rejected',
       rejectReason: detail,
@@ -861,7 +893,11 @@ export class CalibrationRunner {
               ? Number(fill.filledAtMs) - Number(fill.arrivedAtMs)
               : null,
           fillReason: fill?.reason ?? null,
-          queueAtEntry: fill?.queueAheadAtEntry ?? order?.queue?.queueAheadAtEntry ?? null,
+          queueAtEntry:
+            fill?.queueAheadAtEntry ??
+            order?.queue?.queueAheadAtEntry ??
+            probe.modelledQueueAtEntry.get(c.model.name) ??
+            null,
           queueBeforeFill: fill?.queueAheadBeforeFill ?? null,
         })
         .catch(() => {});
@@ -908,7 +944,16 @@ export class CalibrationRunner {
       const activity = this.levels.snapshot(probe.levelKey);
 
       probe.queueSeqNo += 1;
-      if (probe.queueSeqNo === 1) {
+
+      // The FIRST reading that actually has a number, not the first poll.
+      //
+      // A new order does not appear in the queue-position endpoint
+      // immediately: measured at roughly five seconds on this account. Taking
+      // the first poll would have recorded null as the entry queue for every
+      // probe, which is what the first live run did. The delay is itself worth
+      // knowing, so the observation's own timestamps are stored with it.
+      if (queuePosition !== null && !probe.recordedInitialQueue) {
+        probe.recordedInitialQueue = true;
         await this.store
           .recordInitialQueue(probe.probeId, {
             queuePosition,
@@ -917,7 +962,7 @@ export class CalibrationRunner {
           })
           .catch(() => {});
       }
-      probe.lastQueuePosition = queuePosition;
+      if (queuePosition !== null) probe.lastQueuePosition = queuePosition;
 
       await this.store
         .insertQueueObservation({
@@ -1022,7 +1067,11 @@ export class CalibrationRunner {
     const decisionTsMs = Date.now();
 
     try {
-      const cancelled = await this.deps.trading.cancelOrder(probe.orderId, probe.clientOrderId);
+      const cancelled = await this.deps.trading.cancelOrder(
+        probe.orderId,
+        probe.clientOrderId,
+        probe.marketTicker,
+      );
       await this.store.recordCancel(probe.probeId, {
         decisionTsMs,
         sendTsMs: cancelled.timing.sendTs,
