@@ -13,6 +13,7 @@ import { logger } from '@/src/logging/logger';
  *   npm run silver -- --day 2026-09-14
  *   npm run silver -- --expire        also expire verified days from Postgres
  *   npm run silver -- --status
+ *   npm run silver -- --allow-shrink   permit replacing a larger existing file
  *
  * Exporting is safe to run repeatedly. Expiry is gated on every silver export
  * for the day being verified, and is off unless --expire is passed AND
@@ -60,7 +61,12 @@ async function main(): Promise<void> {
     },
   });
 
-  const exporter = new SilverExporter({ sql, store, datasetId: e.DATASET_ID });
+  const exporter = new SilverExporter({
+    sql,
+    store,
+    datasetId: e.DATASET_ID,
+    allowShrink: argv.includes('--allow-shrink'),
+  });
 
   const explicit = get('--day');
   const days = explicit ? [explicit] : await exporter.completedDays();

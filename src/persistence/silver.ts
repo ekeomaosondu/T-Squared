@@ -154,6 +154,16 @@ export interface SilverOptions {
   datasetId: string;
   /** Only days strictly before this are exported; today is still accumulating. */
   clock?: () => Date;
+  /**
+   * Permit an export that would REPLACE an existing object with fewer rows.
+   *
+   * Off by default. Object paths are deterministic, so a re-export overwrites
+   * in place -- which is right when a partial day is completed, and catastrophic
+   * at a store migration boundary, where the database now holds only the tail
+   * of a day whose head lives solely in the existing Parquet file. That case
+   * would silently delete exchange data from the lake.
+   */
+  allowShrink?: boolean;
 }
 
 export interface SilverResult {
@@ -174,12 +184,14 @@ export class SilverExporter {
   private readonly store: ArchiveStore;
   private readonly datasetId: string;
   private readonly clock: () => Date;
+  private readonly allowShrink: boolean;
 
   constructor(opts: SilverOptions) {
     this.sql = opts.sql;
     this.store = opts.store;
     this.datasetId = opts.datasetId;
     this.clock = opts.clock ?? (() => new Date());
+    this.allowShrink = opts.allowShrink ?? false;
   }
 
   /** UTC days with data that have fully elapsed. */
@@ -365,6 +377,19 @@ export class SilverExporter {
     }
 
     const body = await readFile(parquet);
+
+    // Refuse to replace an existing object with fewer rows. See `allowShrink`.
+    if (!this.allowShrink) {
+      const existing = await this.existingRowCount(conn, objectPath);
+      if (existing !== null && existing > exported) {
+        throw new Error(
+          `refusing to overwrite ${objectPath}: it holds ${existing} row(s) and this export ` +
+            `has only ${exported}. The database no longer covers the whole day -- re-exporting ` +
+            'would delete exchange data from the lake. Pass allowShrink to override.',
+        );
+      }
+    }
+
     await this.store.put(objectPath, body);
 
     // Verify by reading the object back, not by trusting the upload.
@@ -397,6 +422,40 @@ export class SilverExporter {
     `;
 
     return { bytes: body.byteLength, exported, sourceCount };
+  }
+
+  /**
+   * Rows in the object already at this path, or null if there is none.
+   *
+   * Read through DuckDB rather than downloading: only the Parquet footer is
+   * fetched, so the check costs a couple of range requests.
+   */
+  private async existingRowCount(
+    conn: import('@duckdb/node-api').DuckDBConnection,
+    objectPath: string,
+  ): Promise<number | null> {
+    if (!(await this.store.exists(objectPath))) return null;
+    try {
+      const body = await this.store.get(objectPath);
+      const scratch = await mkdtemp(path.join(tmpdir(), 'kx-silver-prev-'));
+      const local = path.join(scratch, 'previous.parquet');
+      try {
+        const { writeFile } = await import('node:fs/promises');
+        await writeFile(local, body);
+        const counted = await conn.runAndReadAll(
+          `SELECT count(*) AS n FROM read_parquet('${local.replace(/'/g, "''")}')`,
+        );
+        return Number((counted.getRowObjects()[0] as { n: unknown }).n);
+      } finally {
+        await rm(scratch, { recursive: true, force: true });
+      }
+    } catch (err) {
+      // An unreadable existing object must not silently disable the guard.
+      throw new Error(
+        `cannot read the existing object at ${objectPath} to check for data loss: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
   }
 
   private async recordFailure(
