@@ -215,7 +215,7 @@ describe('silver Parquet column typing', () => {
 
 describe('bind parameter limits', () => {
   it('chunks statements below the Postgres 65,535 parameter cap', async () => {
-    const { maxRowsPerStatement, chunkRows } = await import('@/src/persistence/batchWriter');
+    const { maxRowsPerStatement } = await import('@/src/persistence/batchWriter');
 
     // A multi-row INSERT uses one parameter per column per row. Exceeding the
     // cap raises MAX_PARAMETERS_EXCEEDED, which is NOT retryable -- so the
