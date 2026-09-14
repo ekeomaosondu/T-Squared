@@ -344,11 +344,22 @@ offer physically is, so the simulated order is identical to the live one.
 ## Performance
 
 One day of the current ~24-market universe should be practical interactively.
-Measured on the 2026-09-13 slice (79 minutes, 12 markets, 54k deltas):
+Measured on the 2026-09-13 slice (79 minutes, 24 markets, 94.5k deltas, 2.2k
+trades, a quoting strategy at 100 ms latency):
 
 ```
-~2,000-3,000 events/s   ~175 MB peak RSS
+~7,500 events/s   ~300 MB peak RSS   ~13 s wall
 ```
+
+which projects a full day of the current universe to roughly three minutes.
+Three things got it there and each is load-bearing at scale rather than on the
+test slice:
+
+- resting orders and pending cancels are indexed, instead of scanning every
+  order ever submitted on each event and each trade
+- the BBO is taken by scanning the ladder rather than sorting it, with an
+  equivalence proof against `MarketBook.getYesBBO` in `bookView.test.ts`
+- the mark grid prices only the markets the portfolio holds
 
 Every run reports `events/s`, wall clock, peak RSS and mid-series size in its
 summary. Checkpoint verification costs one ladder hash per checkpoint and can
