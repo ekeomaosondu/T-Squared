@@ -91,7 +91,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<CompletedRu
     fillModel: opts.fillModel.name,
     fillModelParameters: opts.fillModel.describe(),
     latencyModel: opts.latency.describe(),
-    feeModel: opts.feeModel.describe(),
+    feeModel: opts.feeModel.provenance() as unknown as Record<string, unknown>,
     captureGapPolicy: gapPolicy,
     gapOrderPolicy,
     markIntervalMs,

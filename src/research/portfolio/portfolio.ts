@@ -5,6 +5,8 @@ import {
   newPosition,
   settlePosition,
   unrealizedPnl,
+  voidPosition,
+  type PositionResolution,
   type PositionState,
 } from '@/src/research/portfolio/accounting';
 import type { SimulatedFill } from '@/src/research/execution/simulatedExchange';
@@ -27,6 +29,8 @@ export interface PositionSnapshot {
   mark: string | null;
   collateral: string;
   settled: boolean;
+  resolution: PositionResolution;
+  settlementPayout: string | null;
 }
 
 /**
@@ -42,16 +46,26 @@ export interface PositionSnapshot {
 export interface EquityRow {
   atMs: string;
   cash: string;
-  realizedPnl: string;
-  /** Unrealized PnL of the positions that have a mark. */
-  unrealizedPnl: string;
+  /** Round-trip trading only. */
+  realizedTradingPnl: string;
+  /** Crystallised by exchange determinations. */
+  settlementPnl: string;
+  /** Open positions marked at the last mid. A mark, not a result. */
+  unrealizedMarkPnl: string;
   grossPnl: string;
-  netPnl: string;
+  /**
+   * Gross minus fees, or NULL when any fill's fee could not be verified.
+   *
+   * Null is the point. An unverified fee silently applied as zero produces a
+   * number that looks like a result, and someone will quote it.
+   */
+  netPnl: string | null;
   feesPaid: string;
+  feeVerified: boolean;
   netInventory: string;
   absInventory: string;
   collateral: string;
-  /** Open positions with no mark, and their size. Excluded from the PnL above. */
+  /** Open positions with no mark. Excluded from the figures above. */
   unmarkedPositions: number;
   unmarkedQuantity: string;
 }
@@ -59,11 +73,13 @@ export interface EquityRow {
 export interface PortfolioSnapshot {
   atMs: string;
   cash: string;
-  realizedPnl: string;
-  unrealizedPnl: string | null;
+  realizedTradingPnl: string;
+  settlementPnl: string;
+  unrealizedMarkPnl: string;
   feesPaid: string;
+  feeVerified: boolean;
+  grossPnl: string;
   netPnl: string | null;
-  grossPnl: string | null;
   netInventory: string;
   absInventory: string;
   collateral: string;
@@ -74,8 +90,12 @@ export class Portfolio {
   private readonly positions = new Map<string, PositionState>();
 
   private cashBalance = ZERO;
+  /** Realized PnL from ROUND-TRIP TRADING only. Settlement is separate. */
   private realized = ZERO;
+  /** Realized PnL from exchange determinations. */
+  private settlement = ZERO;
   private fees = ZERO;
+  private unknownFeeFills = 0;
 
   /** Peak absolute inventory summed across markets, and its running integral. */
   private maxAbsInventory = ZERO;
@@ -110,6 +130,13 @@ export class Portfolio {
   get realizedPnl(): Decimal {
     return this.realized;
   }
+  /** PnL crystallised by exchange determinations. */
+  get settlementPnl(): Decimal {
+    return this.settlement;
+  }
+  get unknownFeeFillCount(): number {
+    return this.unknownFeeFills;
+  }
   get feesPaid(): Decimal {
     return this.fees;
   }
@@ -133,13 +160,42 @@ export class Portfolio {
     this.fees = this.fees.plus(fill.fee);
   }
 
-  /** Settles a market at its terminal outcome. Explicit, never a final mark. */
-  settle(marketTicker: string, outcome: 0 | 1): void {
+  /**
+   * Settles a market at the payout the exchange determined.
+   *
+   * Kept in its OWN PnL bucket. Settlement money and trading money answer
+   * different questions: the first says whether the inventory we were left
+   * holding happened to be right, the second says whether the market making
+   * was any good. A maker that loses on spread and is rescued by a lucky
+   * determination has not found an edge, and a single net figure cannot tell
+   * you that.
+   */
+  settle(marketTicker: string, yesPayout: Decimal): void {
     const position = this.positions.get(marketTicker);
     if (!position || position.settled) return;
-    const applied = settlePosition(position, outcome);
+    const applied = settlePosition(position, yesPayout);
     this.cashBalance = this.cashBalance.plus(applied.cashDelta);
-    this.realized = this.realized.plus(applied.realizedDelta);
+    this.settlement = this.settlement.plus(applied.realizedDelta);
+  }
+
+  /** Closes a position in a cancelled market. Returns it at cost, not a payout. */
+  voidMarket(marketTicker: string): void {
+    const position = this.positions.get(marketTicker);
+    if (!position || position.settled) return;
+    const applied = voidPosition(position);
+    this.cashBalance = this.cashBalance.plus(applied.cashDelta);
+  }
+
+  /** Records how an unsettled position finished, for the run report. */
+  resolveAs(marketTicker: string, resolution: PositionResolution): void {
+    const position = this.positions.get(marketTicker);
+    if (!position || position.settled) return;
+    position.resolution = resolution;
+  }
+
+  /** Fills whose fee could not be verified. See FeeModel. */
+  noteUnknownFee(): void {
+    this.unknownFeeFills += 1;
   }
 
   /**
@@ -216,15 +272,19 @@ export class Portfolio {
       unrealized = unrealized.plus(u);
     }
 
-    const gross = this.realized.plus(unrealized);
+    const gross = this.realized.plus(this.settlement).plus(unrealized);
+    const feeVerified = this.unknownFeeFills === 0;
+
     return {
       atMs: atMs.toString(),
       cash: this.cashBalance.toFixed(6),
-      realizedPnl: this.realized.toFixed(6),
-      unrealizedPnl: unrealized.toFixed(6),
+      realizedTradingPnl: this.realized.toFixed(6),
+      settlementPnl: this.settlement.toFixed(6),
+      unrealizedMarkPnl: unrealized.toFixed(6),
       grossPnl: gross.toFixed(6),
-      netPnl: gross.minus(this.fees).toFixed(6),
+      netPnl: feeVerified ? gross.minus(this.fees).toFixed(6) : null,
       feesPaid: this.fees.toFixed(6),
+      feeVerified,
       netInventory: net.toFixed(6),
       absInventory: abs.toFixed(6),
       collateral: collateral.toFixed(6),
@@ -235,7 +295,7 @@ export class Portfolio {
 
   snapshot(atMs: bigint, marks: ReadonlyMap<string, Decimal | null>): PortfolioSnapshot {
     const positions: PositionSnapshot[] = [];
-    let unrealizedTotal: Decimal | null = ZERO;
+    let unrealized = ZERO;
     let net = ZERO;
     let abs = ZERO;
     let collateral = ZERO;
@@ -243,8 +303,7 @@ export class Portfolio {
     for (const position of this.positions.values()) {
       const mark = marks.get(position.marketTicker) ?? null;
       const unreal = unrealizedPnl(position, mark);
-      if (unreal === null) unrealizedTotal = null;
-      else if (unrealizedTotal !== null) unrealizedTotal = unrealizedTotal.plus(unreal);
+      if (unreal !== null) unrealized = unrealized.plus(unreal);
 
       net = net.plus(position.quantity);
       abs = abs.plus(position.quantity.abs());
@@ -260,23 +319,24 @@ export class Portfolio {
         mark: mark === null ? null : mark.toFixed(6),
         collateral: collateralRequired(position).toFixed(6),
         settled: position.settled,
+        resolution: position.resolution,
+        settlementPayout: position.settlementPayout?.toFixed(6) ?? null,
       });
     }
 
-    // Realized and unrealized PnL are both GROSS of fees: fees are accumulated
-    // separately and deducted from cash. So gross is their sum and net
-    // subtracts fees -- which also makes net equal cash plus the marked value
-    // of open positions, and that identity is asserted in the tests.
-    const grossPnl = unrealizedTotal === null ? null : this.realized.plus(unrealizedTotal);
-    const netPnl = grossPnl === null ? null : grossPnl.minus(this.fees);
+    const gross = this.realized.plus(this.settlement).plus(unrealized);
+    const feeVerified = this.unknownFeeFills === 0;
+
     return {
       atMs: atMs.toString(),
       cash: this.cashBalance.toFixed(6),
-      realizedPnl: this.realized.toFixed(6),
-      unrealizedPnl: unrealizedTotal === null ? null : unrealizedTotal.toFixed(6),
+      realizedTradingPnl: this.realized.toFixed(6),
+      settlementPnl: this.settlement.toFixed(6),
+      unrealizedMarkPnl: unrealized.toFixed(6),
       feesPaid: this.fees.toFixed(6),
-      netPnl: netPnl === null ? null : netPnl.toFixed(6),
-      grossPnl: grossPnl === null ? null : grossPnl.toFixed(6),
+      feeVerified,
+      grossPnl: gross.toFixed(6),
+      netPnl: feeVerified ? gross.minus(this.fees).toFixed(6) : null,
       netInventory: net.toFixed(6),
       absInventory: abs.toFixed(6),
       collateral: collateral.toFixed(6),

@@ -44,6 +44,14 @@ export interface FillMarkout {
   referencePrice: string | null;
   reference: MarkoutReference;
   /**
+   * Half-spread captured at the fill: the reference price at the fill instant
+   * minus the fill price, signed so positive is favourable.
+   *
+   * Horizon-independent, and by construction positive for a maker resting
+   * inside the spread. Every realized-edge figure is this plus a drift.
+   */
+  spreadCapture: string | null;
+  /**
    * Total markout from the FILL PRICE, sign-normalized so positive is
    * favourable. This is the whole edge: the half-spread captured plus whatever
    * the market did afterwards.
@@ -106,6 +114,7 @@ export function computeMarkouts(
     const midDrift: Record<string, string | null> = {};
 
     const ref = s ? referenceAt(s, filledAt, reference) : null;
+    const spreadCapture = markoutOf(fill.yesAction, fill.yesPrice, ref);
 
     for (const h of horizons) {
       const future = s ? referenceAt(s, filledAt + h, reference) : null;
@@ -129,6 +138,7 @@ export function computeMarkouts(
       quantity: fill.quantity.toFixed(6),
       referencePrice: ref === null ? null : ref.toFixed(6),
       reference,
+      spreadCapture: spreadCapture === null ? null : spreadCapture.toFixed(6),
       markouts,
       markoutDollars,
       midDrift,
@@ -147,8 +157,25 @@ export interface MarkoutSummary {
   meanMarkout: string | null;
   medianMarkout: string | null;
   totalMarkoutDollars: string | null;
+  /**
+   * Mean half-spread captured, over the SAME fills the drift is measured on.
+   *
+   * Restricted to that subset deliberately, so the decomposition below is an
+   * identity rather than an approximation:
+   *
+   *     realizedEdge = spreadCapture + midDrift
+   */
+  meanSpreadCapture: string | null;
   /** Mean reference-price drift, with the half-spread removed. */
   meanMidDrift: string | null;
+  /**
+   * What the fill was actually worth by this horizon.
+   *
+   * The number a market maker should be looking at: the spread earned at the
+   * touch, less whatever the market took back. A healthy spread capture with a
+   * strongly negative drift is a strategy that is being paid to be wrong.
+   */
+  realizedEdge: string | null;
   /**
    * Share of observations the market moved AGAINST, measured on the drift.
    *
@@ -168,6 +195,7 @@ export function summarizeMarkouts(
     const values: Decimal[] = [];
     let dollars = new Decimal(0);
     let driftSum = new Decimal(0);
+    let captureSum = new Decimal(0);
     let driftObs = 0;
     let unobserved = 0;
     let adverse = 0;
@@ -185,9 +213,10 @@ export function summarizeMarkouts(
       dollars = dollars.plus(new Decimal(m.markoutDollars[key]!));
 
       const drift = m.midDrift[key];
-      if (drift !== null && drift !== undefined) {
+      if (drift !== null && drift !== undefined && m.spreadCapture !== null) {
         const d = new Decimal(drift);
         driftSum = driftSum.plus(d);
+        captureSum = captureSum.plus(new Decimal(m.spreadCapture));
         driftObs += 1;
         if (d.isNegative()) adverse += 1;
       }
@@ -201,7 +230,9 @@ export function summarizeMarkouts(
         meanMarkout: null,
         medianMarkout: null,
         totalMarkoutDollars: null,
+        meanSpreadCapture: null,
         meanMidDrift: null,
+        realizedEdge: null,
         adverseRate: null,
       };
     }
@@ -219,7 +250,9 @@ export function summarizeMarkouts(
       meanMarkout: sum.div(values.length).toFixed(8),
       medianMarkout: median.toFixed(8),
       totalMarkoutDollars: dollars.toFixed(6),
+      meanSpreadCapture: driftObs === 0 ? null : captureSum.div(driftObs).toFixed(8),
       meanMidDrift: driftObs === 0 ? null : driftSum.div(driftObs).toFixed(8),
+      realizedEdge: driftObs === 0 ? null : captureSum.plus(driftSum).div(driftObs).toFixed(8),
       adverseRate: driftObs === 0 ? null : new Decimal(adverse).div(driftObs).toFixed(6),
     };
   });

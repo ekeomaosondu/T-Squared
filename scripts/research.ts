@@ -114,7 +114,7 @@ async function verify(args: Args): Promise<void> {
       request: buildRequest(args),
       strategy: makeStrategy('join-bbo', { marketTickers: ['__none__'] }),
       fillModel: makeFillModel('touch'),
-      feeModel: makeFeeModel('zero'),
+      feeModel: await makeFeeModel('zero'),
       latency: makeLatencyModel(0),
       verifyCheckpoints: true,
     });
@@ -150,7 +150,7 @@ interface BacktestSpec {
   fillModelParams: Record<string, unknown>;
   latencyMs: number;
   feeModel: string;
-  feeModelParams: Record<string, unknown>;
+  feeModelParams: { schedulePath?: string };
 }
 
 /**
@@ -171,7 +171,7 @@ async function runOne(
     request,
     strategy: makeStrategy(spec.strategy, spec.strategyParams),
     fillModel: makeFillModel(spec.fillModel, spec.fillModelParams),
-    feeModel: makeFeeModel(spec.feeModel, spec.feeModelParams),
+    feeModel: await makeFeeModel(spec.feeModel, spec.feeModelParams),
     latency: makeLatencyModel(spec.latencyMs),
     verifyCheckpoints: opts.verifyCheckpoints,
     maxEvents: opts.maxEvents,
@@ -191,8 +191,8 @@ function specFromArgs(args: Args): BacktestSpec {
     fillModel: args.flags.get('fill-model') ?? 'conservative_queue',
     fillModelParams: JSON.parse(args.flags.get('fill-params') ?? '{}') as Record<string, unknown>,
     latencyMs: Number(args.flags.get('latency-ms') ?? 0),
-    feeModel: args.flags.get('fee-model') ?? 'kalshi',
-    feeModelParams: JSON.parse(args.flags.get('fee-params') ?? '{}') as Record<string, unknown>,
+    feeModel: args.flags.get('fee-model') ?? 'kalshi_historical',
+    feeModelParams: { schedulePath: args.flags.get('fee-schedule') },
   };
 }
 
@@ -260,7 +260,7 @@ async function compare(args: Args): Promise<void> {
           fillModel,
           fillModelParams: {},
           latencyMs,
-          feeModel: config.feeModel ?? 'kalshi',
+          feeModel: config.feeModel ?? 'kalshi_historical',
           feeModelParams: {},
         });
       }

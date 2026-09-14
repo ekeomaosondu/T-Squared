@@ -1,0 +1,48 @@
+{
+  "$comment": [
+    "Fee treatment that the Kalshi API does NOT supply.",
+    "",
+    "The API tells us, per series, the fee TYPE ('quadratic') and a",
+    "fee MULTIPLIER. It does not tell us the coefficient inside that formula,",
+    "nor whether a given series charges a maker fee. Those come from Kalshi's",
+    "published fee schedule, which is a document a human reads -- so they are",
+    "asserted here, with a source and a date, rather than hardcoded in the",
+    "engine where nobody would ever question them.",
+    "",
+    "`verified` is the switch that matters. While it is false, every backtest",
+    "reports fee_verified: false and net PnL as N/A, because an unverified fee",
+    "assumption quietly applied is worse than an admitted gap. Set it to true",
+    "only after reading the current schedule for these specific series, and",
+    "record who checked and when."
+  ],
+  "schedules": [
+    {
+      "feeType": "quadratic",
+      "baseRate": "0.07",
+      "makerFeePerContract": "0",
+      "roundUpToCents": true,
+      "effectiveFrom": "1970-01-01T00:00:00Z",
+      "source": "https://kalshi.com/docs/kalshi-fee-schedule.pdf",
+      "verified": false,
+      "verifiedBy": null,
+      "verifiedAt": null,
+      "notes": [
+        "fee = ceil_to_cents(baseRate * multiplier * contracts * P * (1 - P)).",
+        "baseRate 0.07 is the general trading fee Kalshi publishes; it is NOT",
+        "returned by the API and has not been confirmed against the current",
+        "schedule for KXHIGH / KXLOW.",
+        "makerFeePerContract 0 is likewise unconfirmed: Kalshi charges maker",
+        "fees on some markets and not others."
+      ]
+    }
+  ],
+  "makerRebate": null,
+  "$makerRebateComment": [
+    "Kalshi operates a designated market-maker program that can include fee",
+    "reductions or rebates. Those are a PROPERTY OF A PARTICIPANT, not of a",
+    "market, so they are kept separate: ordinary-member economics and",
+    "hypothetical market-maker economics must never be reported as the same",
+    "number. Populate only when we are actually in such a program, and expect",
+    "every result computed with it to be labelled accordingly."
+  ]
+}

@@ -71,47 +71,81 @@ export function renderRun(manifest: RunManifest, summary: RunSummary): string {
   );
   lines.push('');
 
-  lines.push('  markouts (cents per contract, positive = favourable)');
+  // The market-making decomposition, first. For a maker this is the result;
+  // PnL below it is that result plus whatever the inventory happened to do.
+  lines.push('  EXECUTION EDGE (cents per contract, positive = favourable)');
   lines.push(
-    `    ${pad('horizon', 10)}${rpad('markout', 10)}${rpad('median', 10)}` +
-      `${rpad('drift', 10)}${rpad('adverse', 9)}${rpad('n', 8)}${rpad('unobs', 8)}`,
+    `    ${pad('horizon', 10)}${rpad('capture', 10)}${rpad('drift', 10)}` +
+      `${rpad('edge', 10)}${rpad('adverse', 9)}${rpad('n', 8)}${rpad('unobs', 8)}`,
   );
   for (const m of summary.markouts) {
     lines.push(
-      `    ${pad(`${m.horizonMs}ms`, 10)}${rpad(cents(m.meanMarkout), 10)}` +
-        `${rpad(cents(m.medianMarkout), 10)}${rpad(cents(m.meanMidDrift), 10)}` +
+      `    ${pad(`${m.horizonMs}ms`, 10)}${rpad(cents(m.meanSpreadCapture), 10)}` +
+        `${rpad(cents(m.meanMidDrift), 10)}${rpad(cents(m.realizedEdge), 10)}` +
         `${rpad(rate(m.adverseRate), 9)}` +
         `${rpad(String(m.observations), 8)}${rpad(String(m.unobserved), 8)}`,
     );
   }
-  lines.push(
-    '    markout is measured from the FILL PRICE and therefore includes the half-spread a',
-  );
-  lines.push(
-    '    maker earns by construction. drift removes it: it is the same measurement from the',
-  );
-  lines.push(
-    '    mid at the fill, and it is the one that says whether we were picked off.',
-  );
+  lines.push('');
+  lines.push('    capture = mid at the fill minus the fill price: the half-spread earned at');
+  lines.push('              the touch, positive for a maker by construction.');
+  lines.push('    drift   = how far the mid moved afterwards, signed against us. This is the');
+  lines.push('              adverse-selection term.');
+  lines.push('    edge    = capture + drift. What the fill was actually worth by that horizon,');
+  lines.push('              before fees and before anything the inventory did later.');
   lines.push('');
 
   const p = summary.pnl;
-  lines.push(`  gross PnL         $${money(p.grossPnl)}`);
-  lines.push(`  fees              $${money(p.fees)}`);
-  lines.push(`  net PnL           $${money(p.netPnl)}   (per day $${money(p.pnlPerDay)})`);
+  lines.push('  PnL, decomposed');
+  lines.push(`    trading (round trip)   $${money(p.realizedTradingPnl)}`);
+  lines.push(`    settlement             $${money(p.settlementPnl)}`);
+  lines.push(`    open, marked at mid    $${money(p.unrealizedMarkPnl)}`);
+  lines.push(`    gross                  $${money(p.grossPnl)}`);
+  lines.push(`    fees                  -$${money(p.fees)}${p.feeVerified ? '' : '   (UNVERIFIED)'}`);
+  lines.push(
+    `    total economic         ${p.totalEconomicPnl === null ? 'N/A' : `$${money(p.totalEconomicPnl)}`}` +
+      `   (per day ${p.pnlPerDay === null ? 'N/A' : `$${money(p.pnlPerDay)}`})`,
+  );
+  if (!p.feeVerified) {
+    lines.push(
+      '    NOTE  the fee schedule could not be verified for every fill, so net and total',
+    );
+    lines.push(
+      '          economic PnL are withheld rather than computed against an assumed rate.',
+    );
+  }
+  lines.push('');
+
+  const r = p.resolution;
+  lines.push(
+    `  positions         ${r.settled} settled | ${r.voided} voided | ` +
+      `${r.openAtRunEnd} open at run end | ${r.awaitingDetermination} awaiting determination | ` +
+      `${r.unpriceable} unpriceable`,
+  );
+  if (r.provisional > 0) {
+    lines.push(
+      `                    ${r.provisional} settled on a PROVISIONAL determination, which the exchange may revise`,
+    );
+  }
+  if (r.noMarketState > 0) {
+    lines.push(
+      `                    ${r.noMarketState} held market(s) have no record in the lake; run \`npm run silver -- --market-state\``,
+    );
+  }
+  if (r.awaitingDetermination > 0) {
+    lines.push(
+      '                    awaiting determination is NOT a data gap: trading is over and the',
+    );
+    lines.push(
+      '                    exchange has not ruled. Re-run after the next market-state snapshot.',
+    );
+  }
   lines.push(`  max drawdown      $${money(p.maxDrawdown)}`);
   lines.push(
     `  inventory         mean |q| ${summary.inventory.meanAbsInventory ?? 'n/a'} | ` +
       `max |q| ${new Decimal(summary.inventory.maxAbsInventory).toFixed(1)} | ` +
       `max collateral $${money(summary.inventory.maxCollateral)}`,
   );
-  if (Number(p.finalAbsInventory) > 0) {
-    lines.push(
-      `  NOTE              ${new Decimal(p.finalAbsInventory).toFixed(1)} contracts still open across ` +
-        `${p.finalPositionsOpen} market(s); that part of net PnL is a mark, not a result. ` +
-        'Phase 1 does not settle -- the lake carries no lifecycle events.',
-    );
-  }
   if (p.unmarkedPositions > 0) {
     lines.push(
       `  NOTE              ${p.unmarkedPositions} open position(s), ` +
@@ -144,11 +178,11 @@ export function renderComparison(runs: readonly CompletedRun[]): string {
     rpad('lat', 5),
     rpad('fills', 7),
     rpad('rate', 7),
-    rpad('spr(c)', 8),
-    rpad('mk1s', 8),
-    rpad('dr100', 8),
+    rpad('capture', 9),
     rpad('dr1s', 8),
     rpad('dr30s', 8),
+    rpad('edge1s', 9),
+    rpad('edge30s', 9),
     rpad('adv', 7),
     rpad('mean|q|', 9),
     rpad('max|q|', 8),
@@ -165,11 +199,11 @@ export function renderComparison(runs: readonly CompletedRun[]): string {
       rpad(String((run.manifest.latencyModel.marketDataMs as number | undefined) ?? 0), 5),
       rpad(String(s.execution.fills), 7),
       rpad(new Decimal(s.execution.fillRate).toFixed(3), 7),
-      rpad(cents(s.execution.averageSpreadCaptured), 8),
-      rpad(cents(at(1_000)?.meanMarkout), 8),
-      rpad(cents(at(100)?.meanMidDrift), 8),
+      rpad(cents(at(1_000)?.meanSpreadCapture), 9),
       rpad(cents(at(1_000)?.meanMidDrift), 8),
       rpad(cents(at(30_000)?.meanMidDrift), 8),
+      rpad(cents(at(1_000)?.realizedEdge), 9),
+      rpad(cents(at(30_000)?.realizedEdge), 9),
       rpad(rate(s.adverseSelectionRate), 7),
       rpad(
         s.inventory.meanAbsInventory === null
@@ -178,7 +212,7 @@ export function renderComparison(runs: readonly CompletedRun[]): string {
         9,
       ),
       rpad(new Decimal(s.inventory.maxAbsInventory).toFixed(0), 8),
-      rpad(money(s.pnl.netPnl), 10),
+      rpad(s.pnl.netPnl === null ? 'N/A' : money(s.pnl.netPnl), 10),
       rpad(money(s.pnl.fees), 8),
     ].join('');
   });
@@ -195,13 +229,13 @@ export function renderComparison(runs: readonly CompletedRun[]): string {
     ...rows,
     '',
     'columns, all in cents per contract, positive = favourable:',
-    '  spr    mean half-spread captured per maker fill',
-    '  mk1s   total markout at 1s, from the fill price -- includes spr by construction',
-    '  drNN   mid DRIFT at that horizon, i.e. the same measurement with spr removed.',
-    '         This is the adverse-selection column. Per fill, mk = spr + dr exactly;',
-    '         the column means differ slightly because they average over the fills',
-    '         whose horizon fell inside the recorded data, which is not the same set.',
-    '  adv    share of fills the mid moved against within 1s',
+    '  capture  half-spread earned at the touch; positive for a maker by construction',
+    '  drNN     how far the mid moved afterwards, signed against us: adverse selection',
+    '  edgeNN   capture + drift, i.e. what the fill was actually worth by that horizon',
+    '  adv      share of fills the mid moved against within 1s',
+    '',
+    'A large capture with a strongly negative drift is a strategy being paid to be wrong.',
+    'Read edge30s before net$.',
     '',
     equality.length === 0
       ? 'book NOT verified: no recorded checkpoints in this window.'
@@ -213,8 +247,9 @@ export function renderComparison(runs: readonly CompletedRun[]): string {
     'calibrated against real fills, so the fill count -- and everything downstream of it --',
     'is a modelling assumption. Read the relative ordering and the drift columns.',
     '',
-    'net$ also carries end-of-window inventory marked at the last mid, because Phase 1',
-    'does not settle. Where mean|q| is large, net$ is mostly that mark.',
+    'net$ is N/A wherever the fee schedule could not be verified for every fill; see',
+    'config/feeSchedule.json. It also carries settled payouts and any residual inventory',
+    'marked at the last mid, so where mean|q| is large it is substantially a mark.',
     '',
   ].join('\n');
 }

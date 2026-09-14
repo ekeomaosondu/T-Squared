@@ -1,4 +1,5 @@
 import type { DuckDBConnection, DuckDBInstance } from '@duckdb/node-api';
+import { D } from '@/src/book/decimal';
 import {
   fingerprintObjects,
   LAKE_TABLES,
@@ -13,6 +14,11 @@ import type {
   HistoricalDataSource,
   HistoricalRequest,
 } from '@/src/research/data/historicalDataSource';
+import {
+  resolveLifecycleState,
+  yesPayout,
+  type HistoricalMarketState,
+} from '@/src/research/data/marketDefinitions';
 import {
   compareOrderKeys,
   orderKeyOf,
@@ -120,6 +126,27 @@ interface RawSnapshot {
   yes_bids_json: string;
   no_bids_json: string;
   state_hash: string | null;
+}
+
+interface RawMarketState {
+  market_ticker: string;
+  event_ticker: string | null;
+  series_ticker: string | null;
+  status: string | null;
+  result: string | null;
+  settlement_value: string | null;
+  notional_value: string | null;
+  is_provisional: boolean | null;
+  strike_type: string | null;
+  floor_strike: string | null;
+  cap_strike: string | null;
+  close_time_ms: bigint | null;
+  settlement_ts_ms: bigint | null;
+  result_first_observed_at_ms: bigint | null;
+  fee_type: string | null;
+  fee_multiplier: string | null;
+  fee_updated_at_ms: bigint | null;
+  settlement_sources_json: string | null;
 }
 
 /** Snapshot sources the exchange actually sent. See BookSnapshotEvent. */
@@ -298,6 +325,76 @@ export class DuckDBHistoricalDataSource implements HistoricalDataSource {
         affectedMarkets: [...g.affectedMarkets],
       })),
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Market definitions and determinations
+  // -------------------------------------------------------------------------
+
+  /**
+   * The most recent known state of every market in the slice.
+   *
+   * "Most recent" across ALL snapshot dates, not the run window's date. A
+   * daily temperature market closes in the small hours and is determined from
+   * the following morning's climate report, so the fact that settles Monday's
+   * book only exists in Tuesday's snapshot. Reading the window's own date
+   * would report every market as undetermined forever.
+   *
+   * Series and market filters are applied, but the TIME filter deliberately is
+   * not: the whole point is to reach a determination recorded after the window
+   * closed.
+   */
+  async marketStates(req: HistoricalRequest): Promise<Map<string, HistoricalMarketState>> {
+    const conn = await this.connection();
+
+    const filters: string[] = [];
+    if (req.seriesTickers?.length) filters.push(`m.series IN (${sqlList(req.seriesTickers)})`);
+    if (req.eventTickers?.length) filters.push(`m.event_ticker IN (${sqlList(req.eventTickers)})`);
+    if (req.marketTickers?.length) {
+      filters.push(`m.market_ticker IN (${sqlList(req.marketTickers)})`);
+    }
+    const where = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
+
+    const rows = await this.rows<RawMarketState>(
+      conn,
+      `SELECT latest.market_ticker, latest.event_ticker, latest.series_ticker,
+              latest.status, latest.result,
+              CAST(latest.settlement_value AS VARCHAR) AS settlement_value,
+              CAST(latest.notional_value AS VARCHAR) AS notional_value,
+              latest.is_provisional,
+              latest.strike_type,
+              CAST(latest.floor_strike AS VARCHAR) AS floor_strike,
+              CAST(latest.cap_strike AS VARCHAR) AS cap_strike,
+              latest.close_time_ms, latest.settlement_ts_ms,
+              latest.result_first_observed_at_ms,
+              latest.fee_type,
+              CAST(latest.fee_multiplier AS VARCHAR) AS fee_multiplier,
+              latest.fee_updated_at_ms,
+              latest.settlement_sources_json
+         FROM (
+           SELECT m.*,
+                  row_number() OVER (
+                    PARTITION BY m.market_ticker
+                        ORDER BY m.date DESC, m.last_refreshed_at_ms DESC
+                  ) AS rn
+             FROM read_parquet('${this.glob(LAKE_TABLES.marketState)}', hive_partitioning = true) AS m
+             ${where}
+         ) AS latest
+        WHERE latest.rn = 1
+        ORDER BY latest.market_ticker`,
+    ).catch((err) => {
+      // A lake with no market-state snapshot yet is a real state, not a crash:
+      // it means settlement is unavailable and the run must say so.
+      logger.warn(
+        { event: 'market_state_unavailable', err: String(err) },
+        'no market_state snapshot in the lake; positions cannot be settled',
+      );
+      return [] as RawMarketState[];
+    });
+
+    const out = new Map<string, HistoricalMarketState>();
+    for (const r of rows) out.set(r.market_ticker, toMarketState(r));
+    return out;
   }
 
   // -------------------------------------------------------------------------
@@ -734,4 +831,45 @@ export function logSliceSummary(slice: DatasetSlice): void {
     `slice ${slice.fingerprint.slice(0, 12)}: ${slice.marketTickers.length} market(s), ` +
       `${slice.captureGaps.length} capture gap(s)`,
   );
+}
+
+function toMarketState(r: RawMarketState): HistoricalMarketState {
+  const state = resolveLifecycleState(r.status, r.result);
+  const settlementValue = r.settlement_value === null ? null : D(r.settlement_value);
+  const notionalValue = r.notional_value === null ? null : D(r.notional_value);
+  const payout = yesPayout(state, settlementValue, notionalValue);
+
+  let sources: string[] = [];
+  if (r.settlement_sources_json) {
+    try {
+      const parsed = JSON.parse(r.settlement_sources_json) as { name?: string; url?: string }[];
+      sources = parsed.map((s) => s.name ?? s.url ?? '').filter(Boolean);
+    } catch {
+      sources = [];
+    }
+  }
+
+  return {
+    marketTicker: r.market_ticker,
+    eventTicker: r.event_ticker,
+    seriesTicker: r.series_ticker,
+    state,
+    rawStatus: r.status,
+    rawResult: r.result,
+    yesSettlementValue: payout.value,
+    settlementBasis: payout.basis,
+    notionalValue,
+    isProvisional: r.is_provisional === true,
+    closeTimeMs: r.close_time_ms === null ? null : BigInt(r.close_time_ms),
+    settlementTimeMs: r.settlement_ts_ms === null ? null : BigInt(r.settlement_ts_ms),
+    observedAtMs:
+      r.result_first_observed_at_ms === null ? null : BigInt(r.result_first_observed_at_ms),
+    strikeType: r.strike_type,
+    floorStrike: r.floor_strike === null ? null : D(r.floor_strike),
+    capStrike: r.cap_strike === null ? null : D(r.cap_strike),
+    feeType: r.fee_type,
+    feeMultiplier: r.fee_multiplier === null ? null : D(r.fee_multiplier),
+    feeUpdatedAtMs: r.fee_updated_at_ms === null ? null : BigInt(r.fee_updated_at_ms),
+    settlementSources: sources,
+  };
 }

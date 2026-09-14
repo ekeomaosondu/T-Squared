@@ -1,4 +1,3 @@
-import { D } from '@/src/book/decimal';
 import type { FillModel } from '@/src/research/execution/fills/fillModel';
 import { TouchFillModel } from '@/src/research/execution/fills/touchFillModel';
 import { ConservativeQueueModel } from '@/src/research/execution/fills/conservativeQueueModel';
@@ -8,7 +7,8 @@ import {
   ZeroLatencyModel,
   type LatencyModel,
 } from '@/src/research/execution/latencyModel';
-import { KalshiFeeModel, ZeroFeeModel, type FeeModel } from '@/src/research/portfolio/fees';
+import { KalshiHistoricalFeeModel, ZeroFeeModel, type FeeModel } from '@/src/research/portfolio/fees';
+import { loadFeeSchedule, type FeeScheduleFile } from '@/src/research/portfolio/feeSchedule';
 import type { Strategy } from '@/src/research/strategy/strategy';
 import { JoinBboStrategy } from '@/src/research/strategies/joinBbo';
 import { ImbalanceMakerStrategy } from '@/src/research/strategies/imbalanceMaker';
@@ -67,20 +67,27 @@ export function makeLatencyModel(ms: number): LatencyModel {
   return FixedLatencyModel.uniform(ms);
 }
 
-export function makeFeeModel(name: string, params: Record<string, unknown> = {}): FeeModel {
+/**
+ * Fee models by name.
+ *
+ * `kalshi_historical` needs the asserted schedule, so it is async: the
+ * alternative is a lazily-loaded module singleton, which would make a run's
+ * fee treatment depend on whatever the file said the first time any code path
+ * happened to touch it.
+ */
+export async function makeFeeModel(
+  name: string,
+  opts: { schedulePath?: string; schedule?: FeeScheduleFile } = {},
+): Promise<FeeModel> {
   switch (name) {
+    case 'kalshi_historical':
     case 'kalshi':
-      return new KalshiFeeModel({
-        takerRate: params.takerRate === undefined ? undefined : D(params.takerRate as string),
-        makerFeePerContract:
-          params.makerFeePerContract === undefined
-            ? undefined
-            : D(params.makerFeePerContract as string),
-        roundUpToCents: params.roundUpToCents as boolean | undefined,
-      });
+      return new KalshiHistoricalFeeModel(
+        opts.schedule ?? (await loadFeeSchedule(opts.schedulePath)),
+      );
     case 'zero':
       return new ZeroFeeModel();
     default:
-      throw new Error(`unknown fee model "${name}". Known: kalshi, zero`);
+      throw new Error(`unknown fee model "${name}". Known: kalshi_historical, zero`);
   }
 }

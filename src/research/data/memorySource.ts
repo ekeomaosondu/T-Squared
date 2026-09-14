@@ -6,6 +6,7 @@ import type {
   HistoricalRequest,
 } from '@/src/research/data/historicalDataSource';
 import { isMarketEvent, type ResearchEvent } from '@/src/research/events/researchEvent';
+import type { HistoricalMarketState } from '@/src/research/data/marketDefinitions';
 
 /**
  * A data source backed by an in-memory event list.
@@ -27,6 +28,7 @@ export class MemoryHistoricalDataSource implements HistoricalDataSource {
   constructor(
     private readonly events: readonly ResearchEvent[],
     private readonly bookCheckpoints: readonly BookCheckpoint[] = [],
+    private readonly states: ReadonlyMap<string, HistoricalMarketState> = new Map(),
   ) {}
 
   private inWindow(event: ResearchEvent, req: HistoricalRequest): boolean {
@@ -79,6 +81,10 @@ export class MemoryHistoricalDataSource implements HistoricalDataSource {
 
   async checkpoints(_req: HistoricalRequest): Promise<BookCheckpoint[]> {
     return [...this.bookCheckpoints];
+  }
+
+  async marketStates(_req: HistoricalRequest): Promise<Map<string, HistoricalMarketState>> {
+    return new Map(this.states);
   }
 
   async close(): Promise<void> {}

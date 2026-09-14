@@ -2,6 +2,7 @@ import { Decimal, D, ONE, ZERO, canonicalPrice } from '@/src/book/decimal';
 import type { BookDeltaEvent, TradeEvent } from '@/src/research/events/researchEvent';
 import type { BookView, MarketStateStore } from '@/src/research/engine/marketState';
 import type { FeeModel } from '@/src/research/portfolio/fees';
+import type { HistoricalMarketState } from '@/src/research/data/marketDefinitions';
 import type {
   ExecutionAdapter,
   ExecutionMode,
@@ -123,6 +124,14 @@ export interface SimulatedExchangeOptions {
   feeModel: FeeModel;
   latency: LatencyModel;
   /**
+   * Market definitions and fee treatment, keyed by ticker.
+   *
+   * Used ONLY to resolve fees at fill time. The determination fields on these
+   * records are not read here -- settlement happens after the run, where a
+   * strategy cannot reach it.
+   */
+  marketStates?: ReadonlyMap<string, HistoricalMarketState>;
+  /**
    * What to do with resting orders when a capture gap opens.
    *
    * Default `cancel_all`. During a gap the book can move anywhere, so a
@@ -148,6 +157,7 @@ export class SimulatedExchange {
   private readonly feeModel: FeeModel;
   private readonly latency: LatencyModel;
   private readonly gapOrderPolicy: GapOrderPolicy;
+  private readonly marketStates: ReadonlyMap<string, HistoricalMarketState>;
 
   private readonly orders = new Map<string, SimulatedOrder>();
   /** clientOrderId -> orderId, for cancel and replace. */
@@ -181,6 +191,7 @@ export class SimulatedExchange {
     this.feeModel = opts.feeModel;
     this.latency = opts.latency;
     this.gapOrderPolicy = opts.gapOrderPolicy ?? 'cancel_all';
+    this.marketStates = opts.marketStates ?? new Map();
   }
 
   // -------------------------------------------------------------------------
@@ -626,6 +637,8 @@ export class SimulatedExchange {
       quantity,
       yesPrice,
       liquidity,
+      market: this.marketStates.get(order.marketTicker),
+      atMs,
     });
 
     // Reported in the order's own side terms as well as YES terms, so a NO
@@ -648,7 +661,8 @@ export class SimulatedExchange {
       quantity,
       liquidity,
       reason,
-      fee,
+      fee: fee.amount,
+      feeKnown: fee.known,
       submittedAtMs: order.submittedAtMs,
       arrivedAtMs: order.effectiveAtMs,
       filledAtMs: atMs,

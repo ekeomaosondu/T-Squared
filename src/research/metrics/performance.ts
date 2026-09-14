@@ -53,29 +53,50 @@ export interface RunSummary {
     skippedInvalidBook: number;
   };
 
+  /**
+   * PnL, decomposed.
+   *
+   * The components answer different questions and must not be read as one
+   * number. Settlement money says whether the inventory we were left holding
+   * happened to be right; trading money says whether the market making was any
+   * good. A maker that loses on spread and is rescued by a lucky determination
+   * has not found an edge.
+   */
   pnl: {
-    grossPnl: string | null;
+    /** Round-trip trading during the run. */
+    realizedTradingPnl: string;
+    /** Crystallised by exchange determinations after the run. */
+    settlementPnl: string;
+    /** Open positions marked at the last mid. A mark, not a result. */
+    unrealizedMarkPnl: string;
+    grossPnl: string;
     fees: string;
+    /** True only if every fill's fee came from a verified schedule. */
+    feeVerified: boolean;
+    /** Gross minus fees, or null when the fee could not be verified. */
     netPnl: string | null;
-    realizedPnl: string;
-    unrealizedPnl: string | null;
-    /** Open positions with no mark. Excluded from the figures above. */
-    unmarkedPositions: number;
-    unmarkedQuantity: string;
+    /** Everything above, i.e. gross minus fees. Null under the same condition. */
+    totalEconomicPnl: string | null;
     pnlPerDay: string | null;
     pnlPerMarket: string | null;
     pnlPerEvent: string | null;
     maxDrawdown: string;
-    /**
-     * Open contracts at the end of the run.
-     *
-     * Phase 1 does not settle: the silver lake carries no lifecycle events, so
-     * the terminal outcome is unknown and the position is marked at the last
-     * mid instead. A large residual inventory means the net PnL above is
-     * substantially a mark, not a result.
-     */
     finalAbsInventory: string;
     finalPositionsOpen: number;
+    /** Open positions with no mark. Excluded from the figures above. */
+    unmarkedPositions: number;
+    unmarkedQuantity: string;
+    /** How each held position finished. See SettlementReport. */
+    resolution: {
+      settled: number;
+      voided: number;
+      openAtRunEnd: number;
+      awaitingDetermination: number;
+      unpriceable: number;
+      provisional: number;
+      noMarketState: number;
+      basisCounts: Record<string, number>;
+    };
   };
 
   inventory: {
@@ -164,11 +185,14 @@ export function summarizeRun(
       },
 
       pnl: {
-        grossPnl: gross?.toFixed(6) ?? null,
+        realizedTradingPnl: result.portfolio.realizedPnl.toFixed(6),
+        settlementPnl: result.portfolio.settlementPnl.toFixed(6),
+        unrealizedMarkPnl: last?.unrealizedMarkPnl ?? '0.000000',
+        grossPnl: gross?.toFixed(6) ?? '0.000000',
         fees: result.portfolio.feesPaid.toFixed(6),
+        feeVerified: last?.feeVerified ?? true,
         netPnl: net?.toFixed(6) ?? null,
-        realizedPnl: result.portfolio.realizedPnl.toFixed(6),
-        unrealizedPnl: last?.unrealizedPnl ?? null,
+        totalEconomicPnl: net?.toFixed(6) ?? null,
         pnlPerDay:
           net === null || spanDays === null || spanDays.lte(0) ? null : net.div(spanDays).toFixed(6),
         pnlPerMarket: net === null || markets === 0 ? null : net.div(markets).toFixed(6),
@@ -181,6 +205,16 @@ export function summarizeRun(
         finalPositionsOpen: openPositions,
         unmarkedPositions: last?.unmarkedPositions ?? 0,
         unmarkedQuantity: last?.unmarkedQuantity ?? '0',
+        resolution: {
+          settled: result.settlement.settled,
+          voided: result.settlement.voided,
+          openAtRunEnd: result.settlement.openAtRunEnd,
+          awaitingDetermination: result.settlement.awaitingDetermination,
+          unpriceable: result.settlement.unpriceable,
+          provisional: result.settlement.provisional.length,
+          noMarketState: result.settlement.noMarketState.length,
+          basisCounts: result.settlement.basisCounts,
+        },
       },
 
       inventory: {

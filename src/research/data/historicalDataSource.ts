@@ -1,4 +1,5 @@
 import type { ResearchEvent } from '@/src/research/events/researchEvent';
+import type { HistoricalMarketState } from '@/src/research/data/marketDefinitions';
 
 /**
  * Where a backtest gets its events.
@@ -72,5 +73,15 @@ export interface HistoricalDataSource {
   stream(request: HistoricalRequest): AsyncIterable<ResearchEvent>;
   /** Independently recorded book hashes, in time order. */
   checkpoints(request: HistoricalRequest): Promise<BookCheckpoint[]>;
+  /**
+   * Definitions, determinations and fee treatment, keyed by market ticker.
+   *
+   * Deliberately NOT part of the event stream. A determination is decided long
+   * after the trading it settles, so delivering it as an event would either
+   * file it under the wrong instant or hand a strategy the answer. It is read
+   * once, used only by post-run accounting, and never reaches a strategy
+   * callback.
+   */
+  marketStates(request: HistoricalRequest): Promise<Map<string, HistoricalMarketState>>;
   close(): Promise<void>;
 }

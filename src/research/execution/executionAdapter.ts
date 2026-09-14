@@ -68,6 +68,16 @@ export interface Fill {
 
   readonly liquidity: Liquidity;
   readonly fee: Decimal;
+  /**
+   * Whether the fee is KNOWN, as opposed to zero.
+   *
+   * A live venue always reports what it charged, so this is true there. A
+   * simulator can only apply a fee it can justify, and false means the
+   * schedule for this market could not be verified -- so `fee` is a
+   * placeholder and any net figure derived from this fill must be reported as
+   * unavailable rather than as a number.
+   */
+  readonly feeKnown: boolean;
 
   readonly submittedAtMs: bigint;
   readonly arrivedAtMs: bigint;

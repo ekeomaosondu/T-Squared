@@ -35,8 +35,36 @@ export interface PositionState {
   notional: Decimal;
   fillCount: number;
   settled: boolean;
-  settlementOutcome: 0 | 1 | null;
+  /** Payout per YES contract actually applied, in dollars. */
+  settlementPayout: Decimal | null;
+  /** How the position finished. See PositionResolution. */
+  resolution: PositionResolution;
 }
+
+/**
+ * How a position finished, and WHY that is the answer.
+ *
+ * Four of these look alike in a PnL total and mean entirely different things:
+ *
+ *   SETTLED                the exchange determined the market; this is a fact
+ *   VOIDED                 the market was cancelled; the position closed at cost
+ *   OPEN_AT_RUN_END        the market was still trading when our window ended,
+ *                          so the value is a mark and would change if the run
+ *                          were extended
+ *   AWAITING_DETERMINATION trading is over and the exchange has not yet ruled;
+ *                          extending the run would NOT help, only waiting will
+ *   UNPRICEABLE            no determination and no mark; excluded from PnL
+ *
+ * Collapsing "we stopped early" into "we cannot price it" would hide a
+ * fixable data gap behind an unfixable one.
+ */
+export type PositionResolution =
+  | 'FLAT'
+  | 'SETTLED'
+  | 'VOIDED'
+  | 'OPEN_AT_RUN_END'
+  | 'AWAITING_DETERMINATION'
+  | 'UNPRICEABLE';
 
 export function newPosition(marketTicker: string): PositionState {
   return {
@@ -50,7 +78,8 @@ export function newPosition(marketTicker: string): PositionState {
     notional: ZERO,
     fillCount: 0,
     settled: false,
-    settlementOutcome: null,
+    settlementPayout: null,
+    resolution: 'FLAT',
   };
 }
 
@@ -128,31 +157,60 @@ export function applyFillToPosition(
 }
 
 /**
- * Settles a position against the market outcome.
+ * Settles a position at the payout the exchange determined.
  *
- * Explicit and terminal: a YES contract pays exactly $1 if the event occurred
- * and exactly $0 otherwise, so the entire remaining position converts to cash
- * and the unrealized PnL becomes realized. There is no closing price and no
- * final mark -- treating settlement as "mark at the last mid" would silently
- * carry the market's uncertainty into a number that has none.
+ * Explicit and terminal. A YES contract pays exactly its notional if the event
+ * occurred and exactly nothing otherwise, so the entire remaining position
+ * converts to cash and the unrealized PnL becomes realized. There is no
+ * closing price and no final mark -- treating settlement as "mark at the last
+ * mid" carries the market's uncertainty into a number that has none.
+ *
+ * @param yesPayout payout per YES contract, normalised to 0..1. Taken from
+ *                  the exchange's `settlement_value` where available rather
+ *                  than inferred, and NEVER from a weather observation: the
+ *                  preliminary reading and the final climate report disagree
+ *                  often enough that settling from the former would be
+ *                  measuring a different market.
  */
-export function settlePosition(position: PositionState, outcome: 0 | 1): FillApplication {
+export function settlePosition(position: PositionState, yesPayout: Decimal): FillApplication {
   if (position.settled) {
     throw new Error(`${position.marketTicker} is already settled`);
   }
   const qty = position.quantity;
-  const value = new Decimal(outcome);
 
-  const realizedDelta = qty.mul(value.minus(position.averageEntryPrice));
-  const cashDelta = qty.mul(value);
+  const realizedDelta = qty.mul(yesPayout.minus(position.averageEntryPrice));
+  const cashDelta = qty.mul(yesPayout);
 
-  position.realizedPnl = position.realizedPnl.plus(realizedDelta);
   position.settled = true;
-  position.settlementOutcome = outcome;
+  position.settlementPayout = yesPayout;
+  position.resolution = 'SETTLED';
   position.quantity = ZERO;
   position.averageEntryPrice = ZERO;
 
   return { cashDelta, realizedDelta, closedQuantity: qty.abs() };
+}
+
+/**
+ * Closes a position in a VOIDED market.
+ *
+ * Kalshi cancels markets. A void returns the position at cost, so the
+ * economic result is exactly zero rather than a payout of either side. Booking
+ * it as a determination in either direction invents a dollar per contract.
+ */
+export function voidPosition(position: PositionState): FillApplication {
+  if (position.settled) {
+    throw new Error(`${position.marketTicker} is already settled`);
+  }
+  const qty = position.quantity;
+  const cashDelta = qty.mul(position.averageEntryPrice);
+
+  position.settled = true;
+  position.settlementPayout = null;
+  position.resolution = 'VOIDED';
+  position.quantity = ZERO;
+  position.averageEntryPrice = ZERO;
+
+  return { cashDelta, realizedDelta: ZERO, closedQuantity: qty.abs() };
 }
 
 /** Unrealized PnL of an open position at a mark. Null when there is no mark. */

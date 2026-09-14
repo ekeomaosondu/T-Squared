@@ -4,6 +4,7 @@ import { env } from '@/src/config/env';
 import { selectArchiveStore } from '@/src/persistence/archiveStore';
 import { closeDb, db } from '@/src/persistence/db';
 import { SilverExporter } from '@/src/persistence/silver';
+import { MarketStateExporter } from '@/src/persistence/silverMarketState';
 import { logger } from '@/src/logging/logger';
 
 /**
@@ -14,6 +15,7 @@ import { logger } from '@/src/logging/logger';
  *   npm run silver -- --expire        also expire verified days from Postgres
  *   npm run silver -- --status
  *   npm run silver -- --allow-shrink   permit replacing a larger existing file
+ *   npm run silver -- --market-state   snapshot market definitions and results only
  *
  * Exporting is safe to run repeatedly. Expiry is gated on every silver export
  * for the day being verified, and is off unless --expire is passed AND
@@ -68,6 +70,20 @@ async function main(): Promise<void> {
     allowShrink: argv.includes('--allow-shrink'),
   });
 
+  const marketState = new MarketStateExporter(sql, store, e.DATASET_ID);
+
+  if (argv.includes('--market-state')) {
+    const snapshot = await marketState.export(get('--snapshot-date'));
+    console.log(
+      `market state ${snapshot.snapshotDate}: ${snapshot.files.length} file(s), ` +
+        `${snapshot.files.reduce((n, f) => n + f.rows, 0)} row(s), ${snapshot.failed.length} failed`,
+    );
+    for (const f of snapshot.failed) console.error(`  FAILED ${f.table}: ${f.error}`);
+    await closeDb();
+    process.exitCode = snapshot.failed.length > 0 ? 1 : 0;
+    return;
+  }
+
   const explicit = get('--day');
   const days = explicit ? [explicit] : await exporter.completedDays();
 
@@ -113,6 +129,18 @@ async function main(): Promise<void> {
       );
     }
   }
+
+  // Always refresh the market-state snapshot alongside a day export. A
+  // determination arrives after the trading it settles, so the freshest
+  // snapshot is the one that can settle the oldest day.
+  const snapshot = await marketState.export();
+  console.log(
+    `  ${snapshot.snapshotDate}  market_state          ` +
+      `${String(snapshot.files.reduce((n, f) => n + f.rows, 0)).padStart(8)} rows in ` +
+      `${snapshot.files.length} file(s)`,
+  );
+  failed += snapshot.failed.length;
+  for (const f of snapshot.failed) console.log(`  FAILED ${f.table}: ${f.error}`);
 
   await closeDb();
   if (failed > 0) process.exit(2);

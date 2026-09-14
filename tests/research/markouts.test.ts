@@ -25,6 +25,7 @@ function fill(over: Partial<SimulatedFill> = {}): SimulatedFill {
     liquidity: 'maker',
     reason: 'queue_depleted',
     fee: D(0),
+    feeKnown: true,
     submittedAtMs: 900n,
     arrivedAtMs: 950n,
     filledAtMs: 1_000n,

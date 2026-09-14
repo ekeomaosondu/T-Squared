@@ -19,7 +19,7 @@ async function run(name: string, params: Record<string, unknown> = {}) {
     request,
     strategy: makeStrategy(name, { size: '10', maxInventory: '30', minSpreadCents: 1, ...params }),
     fillModel: makeFillModel('touch'),
-    feeModel: makeFeeModel('zero'),
+    feeModel: await makeFeeModel('zero'),
     latency: makeLatencyModel(0),
     verifyCheckpoints: false,
     now: () => new Date('2026-09-14T00:00:00.000Z'),

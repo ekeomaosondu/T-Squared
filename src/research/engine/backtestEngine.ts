@@ -31,6 +31,7 @@ import type { LatencyModel } from '@/src/research/execution/latencyModel';
 import type { FeeModel } from '@/src/research/portfolio/fees';
 import { Portfolio, type EquityRow } from '@/src/research/portfolio/portfolio';
 import { MidSeriesStore } from '@/src/research/metrics/midSeries';
+import type { HistoricalMarketState } from '@/src/research/data/marketDefinitions';
 import { logger } from '@/src/logging/logger';
 
 /**
@@ -91,6 +92,27 @@ export interface BacktestOptions {
   verifyCheckpoints?: boolean;
 }
 
+/**
+ * What happened to every position the run was left holding.
+ *
+ * Reported rather than summed away, because the four non-settled outcomes are
+ * not interchangeable: two are data gaps we could close, one is a fact we can
+ * only wait for, and one says the position cannot be valued at all.
+ */
+export interface SettlementReport {
+  settled: number;
+  voided: number;
+  openAtRunEnd: number;
+  awaitingDetermination: number;
+  unpriceable: number;
+  /** Settled positions whose determination the exchange still calls provisional. */
+  provisional: string[];
+  /** Markets held at the end with no record in the lake at all. */
+  noMarketState: string[];
+  /** How each settled payout was established. */
+  basisCounts: Record<string, number>;
+}
+
 /** An interval in which the run refused to trust the book. */
 export interface InvalidInterval {
   marketTicker: string;
@@ -106,6 +128,10 @@ export interface BacktestRunResult {
   portfolio: Portfolio;
   midSeries: MidSeriesStore;
   invalidIntervals: InvalidInterval[];
+  /** Market definitions and determinations used for settlement. */
+  marketStates: Map<string, HistoricalMarketState>;
+  /** How each held position finished, and why. */
+  settlement: SettlementReport;
   /** Compact equity curve on the mark grid. */
   equityCurve: EquityRow[];
   counts: {
@@ -178,6 +204,15 @@ export class BacktestEngine {
   };
   private checkpoints: BookCheckpoint[] = [];
   private checkpointIdx = 0;
+  private marketStates = new Map<string, HistoricalMarketState>();
+
+  /**
+   * Live view of the market states, handed to the exchange at construction.
+   *
+   * The exchange needs them for fees but the source is async, so it receives
+   * this map and the run fills it in before the first event.
+   */
+  private readonly marketStateRef = new Map<string, HistoricalMarketState>();
 
   constructor(private readonly opts: BacktestOptions) {
     this.gapPolicy = opts.gapPolicy ?? 'skip_until_fresh_snapshot';
@@ -189,6 +224,7 @@ export class BacktestEngine {
       feeModel: opts.feeModel,
       latency: opts.latency,
       gapOrderPolicy: opts.gapOrderPolicy,
+      marketStates: this.marketStateRef,
     });
     this.adapter = new SimulatedExecutionAdapter(this.exchange);
 
@@ -225,6 +261,12 @@ export class BacktestEngine {
     if (this.opts.verifyCheckpoints !== false) {
       this.checkpoints = await this.opts.source.checkpoints(this.opts.request);
     }
+
+    // Loaded up front so the exchange can resolve fees per market, and held
+    // for settlement after the run. Determination fields are not read during
+    // the loop.
+    this.marketStates = await this.opts.source.marketStates(this.opts.request);
+    for (const [ticker, state] of this.marketStates) this.marketStateRef.set(ticker, state);
 
     this.opts.strategy.onStart(this.ctx);
 
@@ -290,6 +332,13 @@ export class BacktestEngine {
     }
 
     this.opts.strategy.onStop(this.ctx);
+
+    // Settlement runs AFTER onStop, and reads a map the strategy never had a
+    // reference to. A determination is a fact from after the run window, so
+    // letting it reach a strategy callback -- even the last one -- would be
+    // handing it the answer.
+    const settlement = this.applySettlement(lastEventMs);
+
     this.samplePeakRss();
 
     return {
@@ -299,6 +348,8 @@ export class BacktestEngine {
       portfolio: this.portfolio,
       midSeries: this.midSeries,
       invalidIntervals: this.invalidIntervals,
+      marketStates: this.marketStates,
+      settlement,
       equityCurve: this.equityCurve,
       counts: this.counts,
       bookStats: this.state.stats,
@@ -451,6 +502,81 @@ export class BacktestEngine {
     }
   }
 
+  /**
+   * Applies the exchange's determinations to whatever the run is still holding.
+   *
+   * Every position gets a resolution, and the four unsettled ones are kept
+   * apart on purpose. "The run ended while the market was still trading" is a
+   * window we chose and could extend; "the market closed and the exchange has
+   * not ruled yet" is a fact we can only wait for; "no record in the lake"
+   * is a pipeline gap; "no mark either" means the position cannot be valued at
+   * all. Summing them into one residual would hide three fixable problems
+   * behind one unfixable one.
+   */
+  private applySettlement(lastEventMs: bigint | null): SettlementReport {
+    const report: SettlementReport = {
+      settled: 0,
+      voided: 0,
+      openAtRunEnd: 0,
+      awaitingDetermination: 0,
+      unpriceable: 0,
+      provisional: [],
+      noMarketState: [],
+      basisCounts: {},
+    };
+
+    for (const position of this.portfolio.allPositions()) {
+      if (position.quantity.isZero()) continue;
+      const ticker = position.marketTicker;
+      const state = this.marketStates.get(ticker);
+
+      if (!state) {
+        report.noMarketState.push(ticker);
+        this.portfolio.resolveAs(ticker, this.hasMark(ticker) ? 'OPEN_AT_RUN_END' : 'UNPRICEABLE');
+        if (this.hasMark(ticker)) report.openAtRunEnd += 1;
+        else report.unpriceable += 1;
+        continue;
+      }
+
+      if (state.state === 'VOIDED') {
+        this.portfolio.voidMarket(ticker);
+        report.voided += 1;
+        continue;
+      }
+
+      if (state.yesSettlementValue !== null) {
+        this.portfolio.settle(ticker, state.yesSettlementValue);
+        report.settled += 1;
+        report.basisCounts[state.settlementBasis] =
+          (report.basisCounts[state.settlementBasis] ?? 0) + 1;
+        // A provisional determination can still be revised, so a result built
+        // on one is provisional too and says so.
+        if (state.isProvisional) report.provisional.push(ticker);
+        continue;
+      }
+
+      const marked = this.hasMark(ticker);
+      if (state.state === 'CLOSED_UNDETERMINED') {
+        this.portfolio.resolveAs(ticker, marked ? 'AWAITING_DETERMINATION' : 'UNPRICEABLE');
+        if (marked) report.awaitingDetermination += 1;
+        else report.unpriceable += 1;
+      } else {
+        this.portfolio.resolveAs(ticker, marked ? 'OPEN_AT_RUN_END' : 'UNPRICEABLE');
+        if (marked) report.openAtRunEnd += 1;
+        else report.unpriceable += 1;
+      }
+    }
+
+    // Re-mark after settlement so the final equity row reflects the payouts.
+    if (lastEventMs !== null) this.mark(lastEventMs);
+    return report;
+  }
+
+  private hasMark(marketTicker: string): boolean {
+    const view = this.state.view(marketTicker);
+    return view?.valid === true && view.bbo().mid !== null;
+  }
+
   private drainTimersBefore(atMs: bigint): void {
     for (;;) {
       const due = this.scheduler.peekDueMs();
@@ -466,6 +592,7 @@ export class BacktestEngine {
 
   private applyExchange(result: { updates: SimulatedOrderUpdate[]; fills: SimulatedFill[] }): void {
     for (const fill of result.fills) {
+      if (!fill.feeKnown) this.portfolio.noteUnknownFee();
       this.portfolio.applyFill(fill);
       this.opts.strategy.onFill(fill, this.ctx);
     }

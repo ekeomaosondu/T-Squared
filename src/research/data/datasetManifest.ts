@@ -34,6 +34,10 @@ export const LAKE_TABLES = {
   snapshots: 'snapshots',
   trades: 'trades',
   ticker: 'ticker',
+  /** Dated snapshots of market definitions, determinations and fee treatment. */
+  marketState: 'market_state',
+  /** Every observed change to a market's metadata, for provenance. */
+  marketStateHistory: 'market_state_history',
 } as const;
 
 export type LakeTable = (typeof LAKE_TABLES)[keyof typeof LAKE_TABLES];

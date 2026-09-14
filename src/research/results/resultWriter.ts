@@ -54,6 +54,10 @@ const COLUMN_TYPES: Record<string, string> = {
   filled_quantity: 'DECIMAL(24,6)',
   remaining_quantity: 'DECIMAL(24,6)',
   fee: 'DECIMAL(24,6)',
+  settlement_payout: 'DECIMAL(24,6)',
+  realized_trading_pnl: 'DECIMAL(24,6)',
+  settlement_pnl: 'DECIMAL(24,6)',
+  unrealized_mark_pnl: 'DECIMAL(24,6)',
   queue_ahead_at_entry: 'DECIMAL(24,6)',
   queue_ahead_before_fill: 'DECIMAL(24,6)',
   mid_at_fill: 'DECIMAL(24,6)',
@@ -62,6 +66,8 @@ const COLUMN_TYPES: Record<string, string> = {
   imbalance_1_at_fill: 'DECIMAL(24,8)',
   reference_price: 'DECIMAL(24,6)',
   markout: 'DECIMAL(24,8)',
+  mid_drift: 'DECIMAL(24,8)',
+  spread_capture: 'DECIMAL(24,8)',
   markout_dollars: 'DECIMAL(24,6)',
   average_entry_price: 'DECIMAL(24,6)',
   realized_pnl: 'DECIMAL(24,6)',
@@ -263,7 +269,8 @@ function positionsRows(result: BacktestRunResult): Record<string, unknown>[] {
     fill_count: p.fillCount,
     collateral: s(collateralRequired(p)),
     settled: p.settled,
-    settlement_outcome: p.settlementOutcome,
+    resolution: p.resolution,
+    settlement_payout: s(p.settlementPayout),
   }));
 }
 
@@ -271,11 +278,13 @@ function pnlRows(result: BacktestRunResult): Record<string, unknown>[] {
   return result.equityCurve.map((row) => ({
     at_ms: row.atMs,
     cash: row.cash,
-    realized_pnl: row.realizedPnl,
-    unrealized_pnl: row.unrealizedPnl,
+    realized_trading_pnl: row.realizedTradingPnl,
+    settlement_pnl: row.settlementPnl,
+    unrealized_mark_pnl: row.unrealizedMarkPnl,
     gross_pnl: row.grossPnl,
     net_pnl: row.netPnl,
     fees_paid: row.feesPaid,
+    fee_verified: row.feeVerified,
     net_inventory: row.netInventory,
     abs_inventory: row.absInventory,
     collateral: row.collateral,
@@ -301,8 +310,10 @@ function markoutRows(markouts: readonly FillMarkout[]): Record<string, unknown>[
         quantity: m.quantity,
         reference: m.reference,
         reference_price: m.referencePrice,
+        spread_capture: m.spreadCapture,
         horizon_ms: horizon,
         markout: value,
+        mid_drift: m.midDrift[horizon] ?? null,
         markout_dollars: m.markoutDollars[horizon] ?? null,
       });
     }
